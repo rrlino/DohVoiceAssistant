@@ -1,0 +1,30 @@
+{
+  "voice_assistant": {
+    "llm": {
+      "host": "http://127.0.0.1:8000",
+      "model": "qwen2:1.5b",
+      "timeout": 30
+    },
+    "tts": {
+      "engine": "piper",
+      "voice": "en_US-joe-medium",
+      "speed": 1.0,
+      "piper": {
+        "binary": "~/piper/piper",
+        "models_dir": "~/piper_models",
+        "length_scale": 1.0,
+        "sentence_silence": 0.2
+      }
+    },
+    "audio": {
+      "input_device": null,
+      "output_device": null,
+      "sample_rate": 22050
+    },
+    "behavior": {
+      "wake_word": null,
+      "vad_enabled": true,
+      "barge_in": false
+    }
+  }
+}

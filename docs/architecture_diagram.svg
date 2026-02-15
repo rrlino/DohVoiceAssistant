@@ -1,0 +1,187 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 800" width="1200" height="800">
+  <defs>
+    <!-- Gradients -->
+    <linearGradient id="cardGrad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" style="stop-color:#1f2937"/>
+      <stop offset="100%" style="stop-color:#111827"/>
+    </linearGradient>
+    <linearGradient id="greenGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#22c55e"/>
+      <stop offset="100%" style="stop-color:#16a34a"/>
+    </linearGradient>
+    <linearGradient id="blueGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3b82f6"/>
+      <stop offset="100%" style="stop-color:#2563eb"/>
+    </linearGradient>
+    <linearGradient id="orangeGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f97316"/>
+      <stop offset="100%" style="stop-color:#ea580c"/>
+    </linearGradient>
+
+    <!-- Drop shadow filter -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+
+    <!-- Glow effect -->
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1200" height="800" fill="#0d1117"/>
+
+  <!-- Grid pattern (subtle) -->
+  <pattern id="grid" width="40" height="40" patternUnits="userSpaceOnUse">
+    <path d="M 40 0 L 0 0 0 40" fill="none" stroke="#1c2128" stroke-width="1"/>
+  </pattern>
+  <rect width="1200" height="800" fill="url(#grid)" opacity="0.5"/>
+
+  <!-- Title -->
+  <text x="600" y="50" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="32" font-weight="bold" fill="#f0f6fc">DohVoiceAssistant Architecture</text>
+  <text x="600" y="80" text-anchor="middle" font-family="system-ui, -apple-system, sans-serif" font-size="16" fill="#8b949e">Privacy-first, offline voice assistant for Raspberry Pi 5</text>
+
+  <!-- Raspberry Pi Container -->
+  <rect x="100" y="120" width="1000" height="580" rx="20" ry="20" fill="#161b22" stroke="#30363d" stroke-width="2" filter="url(#shadow)"/>
+
+  <!-- Pi 5 Header -->
+  <rect x="100" y="120" width="1000" height="50" rx="20" ry="20" fill="#1f2937"/>
+  <rect x="100" y="150" width="1000" height="20" fill="#1f2937"/>
+  <text x="140" y="152" font-family="system-ui, sans-serif" font-size="14" font-weight="bold" fill="#22c55e">Raspberry Pi 5</text>
+  <text x="140" y="168" font-family="system-ui, sans-serif" font-size="11" fill="#8b949e">16GB RAM</text>
+
+  <!-- Hailo HAT Badge -->
+  <rect x="850" y="130" width="220" height="35" rx="8" ry="8" fill="url(#greenGrad)" filter="url(#shadow)"/>
+  <text x="960" y="153" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="bold" fill="white">Hailo-10H AI HAT+</text>
+
+  <!-- Microphone (Input) -->
+  <g transform="translate(450, 200)">
+    <rect x="0" y="0" width="300" height="70" rx="12" ry="12" fill="url(#cardGrad)" stroke="#3b82f6" stroke-width="2" filter="url(#shadow)"/>
+    <text x="150" y="35" text-anchor="middle" font-family="system-ui, sans-serif" font-size="16" font-weight="bold" fill="#f0f6fc">Microphone</text>
+    <text x="150" y="55" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#8b949e">USB / ReSpeaker Lite</text>
+  </g>
+
+  <!-- Arrow 1 -->
+  <path d="M 600 270 L 600 310" stroke="#8b949e" stroke-width="3" fill="none" marker-end="url(#arrowhead)"/>
+  <defs>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#8b949e"/>
+    </marker>
+  </defs>
+
+  <!-- Speech-to-Text (Accelerated) -->
+  <g transform="translate(400, 320)">
+    <rect x="0" y="0" width="400" height="80" rx="12" ry="12" fill="url(#cardGrad)" stroke="#22c55e" stroke-width="2" filter="url(#shadow)"/>
+    <text x="200" y="35" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="bold" fill="#f0f6fc">Speech-to-Text</text>
+    <text x="200" y="58" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" fill="#8b949e">Hailo Whisper</text>
+
+    <!-- Accelerated Badge -->
+    <rect x="310" y="-25" width="85" height="26" rx="13" ry="13" fill="url(#greenGrad)" filter="url(#glow)"/>
+    <text x="352" y="-7" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="bold" fill="white">Accelerated</text>
+
+    <!-- Lightning icon -->
+    <text x="320" y="-6" font-family="system-ui, sans-serif" font-size="12" fill="white">⚡</text>
+  </g>
+
+  <!-- Hardware indicator right side -->
+  <g transform="translate(880, 350)">
+    <rect x="0" y="0" width="150" height="40" rx="8" ry="8" fill="#0d1117" stroke="#22c55e" stroke-width="1" stroke-dasharray="4"/>
+    <text x="75" y="18" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="bold" fill="#22c55e">Hailo-10H</text>
+    <text x="75" y="33" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#8b949e">Accelerated</text>
+  </g>
+
+  <!-- Arrow 2 -->
+  <path d="M 600 400 L 600 440" stroke="#8b949e" stroke-width="3" fill="none" marker-end="url(#arrowhead)"/>
+
+  <!-- LLM (Accelerated) -->
+  <g transform="translate(400, 450)">
+    <rect x="0" y="0" width="400" height="80" rx="12" ry="12" fill="url(#cardGrad)" stroke="#22c55e" stroke-width="2" filter="url(#shadow)"/>
+    <text x="200" y="35" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="bold" fill="#f0f6fc">LLM</text>
+    <text x="200" y="58" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" fill="#8b949e">Qwen 2:1.5B</text>
+
+    <!-- Accelerated Badge -->
+    <rect x="310" y="-25" width="85" height="26" rx="13" ry="13" fill="url(#greenGrad)" filter="url(#glow)"/>
+    <text x="352" y="-7" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="bold" fill="white">Accelerated</text>
+    <text x="320" y="-6" font-family="system-ui, sans-serif" font-size="12" fill="white">⚡</text>
+  </g>
+
+  <!-- Hardware indicator right side -->
+  <g transform="translate(880, 480)">
+    <rect x="0" y="0" width="150" height="40" rx="8" ry="8" fill="#0d1117" stroke="#22c55e" stroke-width="1" stroke-dasharray="4"/>
+    <text x="75" y="18" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="bold" fill="#22c55e">Hailo-10H</text>
+    <text x="75" y="33" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#8b949e">Accelerated</text>
+  </g>
+
+  <!-- Arrow 3 -->
+  <path d="M 600 530 L 600 570" stroke="#8b949e" stroke-width="3" fill="none" marker-end="url(#arrowhead)"/>
+
+  <!-- TTS (Bottleneck) -->
+  <g transform="translate(400, 580)">
+    <rect x="0" y="0" width="400" height="80" rx="12" ry="12" fill="url(#cardGrad)" stroke="#f97316" stroke-width="2" filter="url(#shadow)"/>
+    <text x="200" y="35" text-anchor="middle" font-family="system-ui, sans-serif" font-size="18" font-weight="bold" fill="#f0f6fc">Text-to-Speech</text>
+    <text x="200" y="58" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" fill="#8b949e">Piper</text>
+
+    <!-- Bottleneck Badge -->
+    <rect x="300" y="-25" width="95" height="26" rx="13" ry="13" fill="url(#orangeGrad)" filter="url(#glow)"/>
+    <text x="347" y="-7" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="bold" fill="white">Bottleneck</text>
+  </g>
+
+  <!-- Hardware indicator right side (CPU) -->
+  <g transform="translate(880, 580)">
+    <rect x="0" y="0" width="150" height="80" rx="8" ry="8" fill="#0d1117" stroke="#f97316" stroke-width="1" stroke-dasharray="4"/>
+    <text x="75" y="25" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" font-weight="bold" fill="#f97316">Pi 5 CPU</text>
+    <text x="75" y="42" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#8b949e">No acceleration</text>
+    <text x="75" y="60" text-anchor="middle" font-family="system-ui, sans-serif" font-size="10" fill="#f97316">RTF: 0.5-1.0</text>
+    <text x="75" y="73" text-anchor="middle" font-family="system-ui, sans-serif" font-size="9" fill="#8b949e">Target: &lt;0.1</text>
+  </g>
+
+  <!-- Arrow 4 -->
+  <path d="M 600 660 L 600 690" stroke="#8b949e" stroke-width="3" fill="none" marker-end="url(#arrowhead)"/>
+
+  <!-- Speaker (Output) -->
+  <g transform="translate(470, 700)">
+    <rect x="0" y="0" width="260" height="50" rx="12" ry="12" fill="url(#cardGrad)" stroke="#3b82f6" stroke-width="2" filter="url(#shadow)"/>
+    <text x="130" y="25" text-anchor="middle" font-family="system-ui, sans-serif" font-size="14" font-weight="bold" fill="#f0f6fc">Speaker</text>
+    <text x="130" y="42" text-anchor="middle" font-family="system-ui, sans-serif" font-size="11" fill="#8b949e">Bluetooth / USB</text>
+  </g>
+
+  <!-- Side Badges (Left) -->
+  <!-- Local Badge -->
+  <g transform="translate(130, 250)">
+    <rect x="0" y="0" width="110" height="36" rx="18" ry="18" fill="url(#blueGrad)" filter="url(#shadow)"/>
+    <text x="55" y="24" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="bold" fill="white">100% Local</text>
+  </g>
+
+  <!-- Private Badge -->
+  <g transform="translate(130, 310)">
+    <rect x="0" y="0" width="110" height="36" rx="18" ry="18" fill="#a855f7" filter="url(#shadow)"/>
+    <text x="55" y="24" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="bold" fill="white">Private</text>
+  </g>
+
+  <!-- Cost Badge -->
+  <g transform="translate(130, 370)">
+    <rect x="0" y="0" width="110" height="36" rx="18" ry="18" fill="url(#greenGrad)" filter="url(#shadow)"/>
+    <text x="55" y="24" text-anchor="middle" font-family="system-ui, sans-serif" font-size="13" font-weight="bold" fill="white">~£300</text>
+  </g>
+
+  <!-- Zero Cloud Latency Badge -->
+  <g transform="translate(130, 430)">
+    <rect x="0" y="0" width="110" height="36" rx="18" ry="18" fill="#06b6d4" filter="url(#shadow)"/>
+    <text x="55" y="24" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" font-weight="bold" fill="white">0ms Cloud</text>
+  </g>
+
+  <!-- Footer -->
+  <text x="600" y="780" text-anchor="middle" font-family="system-ui, sans-serif" font-size="12" fill="#8b949e" font-style="italic">github.com/rrlino/DohVoiceAssistant</text>
+
+  <!-- Flow labels -->
+  <text x="360" y="295" font-family="system-ui, sans-serif" font-size="11" fill="#8b949e">Voice In</text>
+  <text x="630" y="430" font-family="system-ui, sans-serif" font-size="11" fill="#8b949e">Text</text>
+  <text x="630" y="565" font-family="system-ui, sans-serif" font-size="11" fill="#8b949e">Response</text>
+  <text x="360" y="730" font-family="system-ui, sans-serif" font-size="11" fill="#8b949e">Audio Out</text>
+
+</svg>
