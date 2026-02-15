@@ -166,7 +166,7 @@ MIT License - see [LICENSE](LICENSE)
 
 Building in public. Learning out loud.
 
-Connect: [Your LinkedIn]
+Connect: [LinkedIn](https://www.linkedin.com/in/rrlino/)
 
 ---
 
