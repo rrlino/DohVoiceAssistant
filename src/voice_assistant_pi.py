@@ -24,8 +24,8 @@ import sys
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:8000")
 MODEL = os.environ.get("OLLAMA_MODEL", "qwen2:1.5b")
 
-# TTS: "pyttsx3" (espeak, works everywhere) or "piper" (smoother, needs Piper binary + voice on Pi)
-TTS_ENGINE = os.environ.get("TTS_ENGINE", "pyttsx3")  # use "piper" for smoother voice (requires Piper binary at ~/piper)
+# TTS: "pyttsx3" (espeak, works everywhere), "piper" (smoother), or "supertonic" (fastest, highest quality)
+TTS_ENGINE = os.environ.get("TTS_ENGINE", "piper")
 PIPER_MODEL_DIR = os.environ.get("PIPER_MODEL_DIR", os.path.expanduser("~/piper_models"))
 # Medium quality = less robotic than "low". High = most natural: en_US-ryan-high, en_US-amy-high (larger download)
 PIPER_VOICE = os.environ.get("PIPER_VOICE", "en_US-amy-medium")
@@ -38,6 +38,11 @@ PIPER_NOISE_W = os.environ.get("PIPER_NOISE_W", "0.85")
 PIPER_BIN = os.environ.get("PIPER_BIN", os.path.expanduser("~/piper/piper"))
 PIPER_ESPEAK_DATA = os.environ.get("PIPER_ESPEAK_DATA", os.path.expanduser("~/piper/espeak-ng-data"))
 PIPER_LD_LIBRARY_PATH = os.environ.get("PIPER_LD_LIBRARY_PATH", os.path.expanduser("~/piper"))
+
+# Supertonic TTS settings
+SUPERTONIC_DIR = os.environ.get("SUPERTONIC_DIR", os.path.expanduser("~/supertonic/py"))
+SUPERTONIC_VOICE = os.environ.get("SUPERTONIC_VOICE", "M1")  # Options: M1, M2, F1, F2
+SUPERTONIC_VENV = os.environ.get("SUPERTONIC_VENV", None)  # Path to venv, or None to use system Python
 
 
 def call_llm(prompt: str, host: str = OLLAMA_HOST) -> str:
@@ -152,10 +157,101 @@ def tts_piper(text: str) -> None:
         tts_pyttsx3(text)
 
 
-def speak(text: str) -> None:
+# Global Supertonic instance (lazy-loaded)
+_SUPERTONIC_TTS = None
+_SUPERTONIC_STYLE = None
+
+
+def tts_supertonic(text: str) -> None:
+    """Use Supertonic ONNX TTS - higher quality at 44100Hz, optimized for speed.
+
+    This runs Supertonic in a subprocess using its virtualenv Python, since
+    Supertonic requires onnxruntime, soundfile, librosa which may not be in system Python.
+    """
+    if not os.path.isdir(SUPERTONIC_DIR):
+        print("Supertonic not found, using piper.", file=sys.stderr)
+        tts_piper(text)
+        return
+
+    # Determine the Python interpreter to use
+    venv_python = os.path.join(SUPERTONIC_DIR, ".venv", "bin", "python")
+    if not os.path.isfile(venv_python):
+        venv_python = sys.executable  # Fall back to system Python
+
+    # Escape text for shell
+    escaped_text = text.replace("\\", "\\\\").replace("'", "'\\''")
+
+    # Create a script to generate audio and output to stdout
+    script = f'''
+import sys
+import os
+import tempfile
+os.chdir("{SUPERTONIC_DIR}")
+sys.path.insert(0, "{SUPERTONIC_DIR}")
+
+import numpy as np
+import soundfile as sf
+from helper import load_text_to_speech, load_voice_style
+
+# Load model (cached globally to speed up subsequent calls)
+if not hasattr(sys, '_supertonic_tts'):
+    sys._supertonic_tts = load_text_to_speech("assets/onnx", use_gpu=False)
+    voice_style_path = os.path.join("{SUPERTONIC_DIR}", "assets", "voice_styles", "{SUPERTONIC_VOICE}.json")
+    sys._supertonic_style = load_voice_style([voice_style_path])
+
+tts = sys._supertonic_tts
+style = sys._supertonic_style
+
+# Generate audio with optimized settings
+audio, dur = tts("{escaped_text}", "en", style, total_step=3, speed=1.2)
+
+# Output to temp file
+import tempfile
+with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+    sf.write(tmp.name, audio[0], 44100)
+    print(tmp.name)
+'''
+
+    try:
+        # Run the script in Supertonic's venv
+        result = subprocess.run(
+            [venv_python, "-c", script],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            cwd=SUPERTONIC_DIR,
+        )
+
+        if result.returncode != 0:
+            print(f"Supertonic failed: {result.stderr[:100]}, using piper.", file=sys.stderr)
+            tts_piper(text)
+            return
+
+        # Get the temp file path (last non-empty line of stdout)
+        lines = [l.strip() for l in result.stdout.strip().split('\n') if l.strip()]
+        wav_path = lines[-1] if lines else None
+        if wav_path and wav_path.endswith('.wav') and os.path.exists(wav_path):
+            try:
+                subprocess.run(["paplay", wav_path], check=True, timeout=60)
+            finally:
+                os.unlink(wav_path)
+        else:
+            print("Supertonic failed to generate audio, using piper.", file=sys.stderr)
+            tts_piper(text)
+
+    except Exception as e:
+        print(f"Supertonic failed ({e}), using piper.", file=sys.stderr)
+        tts_piper(text)
+
+
+def speak(text: str, engine: str = None) -> None:
+    """Speak text using specified or default TTS engine."""
     if not text:
         return
-    if TTS_ENGINE == "piper":
+    tts = engine or TTS_ENGINE
+    if tts == "supertonic":
+        tts_supertonic(text)
+    elif tts == "piper":
         tts_piper(text)
     else:
         tts_pyttsx3(text)
@@ -166,7 +262,7 @@ def main():
     ap.add_argument("--host", default=OLLAMA_HOST, help="Ollama/hailo-ollama base URL")
     ap.add_argument("--model", default=MODEL, help="Model name")
     ap.add_argument("--once", metavar="TEXT", help="Single prompt (no interactive loop)")
-    ap.add_argument("--tts", choices=("pyttsx3", "piper"), default=TTS_ENGINE, help="TTS engine")
+    ap.add_argument("--tts", choices=("pyttsx3", "piper", "supertonic"), default=TTS_ENGINE, help="TTS engine")
     ap.add_argument("--no-speak", action="store_true", help="Print response only, no TTS")
     ap.add_argument("--loop", action="store_true", help="Interactive loop: keep prompting until Ctrl+C")
     ap.add_argument("--read", action="store_true", help="Read-only mode: speak text from stdin, no LLM")
@@ -189,10 +285,7 @@ def main():
         if not text:
             sys.exit(0)
         print("Speaking...", file=sys.stderr)
-        if args.tts == "piper":
-            tts_piper(text)
-        else:
-            tts_pyttsx3(text)
+        speak(text, args.tts)
         return
 
     def one_turn(prompt: str) -> None:
@@ -214,26 +307,18 @@ def main():
                 sentences = _split_sentences(buffer)
                 if len(sentences) > 1:
                     to_speak = " ".join(sentences[:-1])
-                    if args.tts == "piper":
-                        tts_piper(to_speak)
-                    else:
-                        tts_pyttsx3(to_speak)
+                    speak(to_speak, args.tts)
                     buffer = sentences[-1]
             print(flush=True)
             if buffer.strip():
-                if args.tts == "piper":
-                    tts_piper(buffer.strip())
-                else:
-                    tts_pyttsx3(buffer.strip())
+                speak(buffer.strip(), args.tts)
         except Exception as e:
             print(f"\nStream error: {e}", file=sys.stderr)
             # Fallback: get full response and speak once
             response = call_llm(prompt.strip(), args.host)
             print("Assistant:", response)
-            if response and args.tts == "piper":
-                tts_piper(response)
-            elif response:
-                tts_pyttsx3(response)
+            if response:
+                speak(response, args.tts)
 
     if args.once:
         one_turn(args.once)

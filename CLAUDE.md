@@ -51,6 +51,21 @@ python3 src/test_pi_qwen.py --prompt "Hello"
 python3 src/test_pi_qwen.py --list
 ```
 
+### Benchmark latency
+```bash
+# Run full benchmark (5 iterations per prompt)
+python3 src/benchmark_latency.py
+
+# More iterations for statistical significance
+python3 src/benchmark_latency.py --iterations 10
+
+# Test specific prompt types
+python3 src/benchmark_latency.py --prompts short medium
+
+# Output as JSON for logging
+python3 src/benchmark_latency.py --json > benchmark_results.json
+```
+
 ## Environment Variables
 
 | Variable | Default | Description |
@@ -65,6 +80,7 @@ python3 src/test_pi_qwen.py --list
 ## Key Files
 
 - `src/voice_assistant_pi.py` - Main voice assistant (text → LLM → TTS). Streams LLM response and speaks sentence-by-sentence for lower perceived latency.
+- `src/benchmark_latency.py` - Latency benchmarking script. Measures LLM TTFT, TTS RTF, and full turn latency against roadmap targets.
 - `src/test_pi_qwen.py` - Test harness for hailo-ollama API from remote machine.
 - `scripts/run_hailo_voice_assistant.sh` - Wrapper for hailo-apps Voice Assistant (full STT → LLM → TTS pipeline).
 - `docs/TTS_SOLUTION_PI5.md` - Sherpa-ONNX integration planned for RTF < 0.1 (Piper currently achieves RTF 0.5-1.0).
