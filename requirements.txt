@@ -1,0 +1,25 @@
+# Voice Assistant Dependencies for Raspberry Pi 5
+# Install with: pip3 install -r requirements.txt
+
+# LLM communication
+requests>=2.28.0
+
+# Speech-to-Text (STT) - choose one:
+# faster-whisper is recommended for Raspberry Pi (fast, efficient)
+faster-whisper>=0.10.0
+
+# Alternative STT engines (uncomment if needed):
+# openai-whisper>=20231117  # Original OpenAI whisper (slower)
+# whisper.cpp needs to be compiled from source, not pip installable
+
+# Voice Activity Detection (for auto-stop recording)
+webrtcvad>=2.0.10
+
+# Silero VAD via sherpa-onnx (more accurate than webrtcvad)
+sherpa-onnx>=1.10.0
+
+# TTS: pyttsx3 (fallback, robotic voice)
+pyttsx3>=2.90
+
+# Note: Piper TTS uses standalone binary, not pip package
+# Install from: https://github.com/rhasspy/piper/releases
