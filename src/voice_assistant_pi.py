@@ -23,7 +23,9 @@ Usage:
   python3 voice_assistant_pi.py --once "Hello"
 """
 import argparse
+import gc
 import json
+import logging
 import os
 import queue
 import re
@@ -69,6 +71,20 @@ AUDIO_CHANNELS = int(os.environ.get("AUDIO_CHANNELS", "1"))
 VAD_SILENCE_MS = int(os.environ.get("VAD_SILENCE_MS", "1000"))  # Silence duration to stop recording
 VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))  # Voice activity threshold (0-1)
 
+# Resource guardrails
+MAX_MEMORY_PERCENT = int(os.environ.get("MAX_MEMORY_PERCENT", "85"))  # Warn at this % memory usage
+CRITICAL_MEMORY_PERCENT = int(os.environ.get("CRITICAL_MEMORY_PERCENT", "95"))  # Force cleanup at this %
+LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "30"))  # Timeout for LLM requests (seconds)
+TTS_TIMEOUT = int(os.environ.get("TTS_TIMEOUT", "30"))  # Timeout for TTS (seconds)
+WATCHDOG_TIMEOUT = int(os.environ.get("WATCHDOG_TIMEOUT", "60"))  # Max seconds between heartbeats
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 
 # ============================================================================
 # Voice Activity Detection (Silero VAD via sherpa-onnx)
@@ -79,6 +95,70 @@ SILERO_VAD_MODEL = os.environ.get(
     "SILERO_VAD_MODEL",
     os.path.expanduser("~/sherpa_models/silero_vad.onnx")
 )
+
+
+# ============================================================================
+# Resource Monitoring and Guardrails
+# ============================================================================
+
+class Watchdog:
+    """Thread health monitor - tracks heartbeats to detect hung threads."""
+
+    def __init__(self, timeout_seconds: int = WATCHDOG_TIMEOUT):
+        self.last_heartbeat = time.time()
+        self.timeout = timeout_seconds
+        self._lock = threading.Lock()
+
+    def heartbeat(self):
+        """Record a heartbeat to indicate thread is alive."""
+        with self._lock:
+            self.last_heartbeat = time.time()
+
+    def is_healthy(self) -> bool:
+        """Check if thread has heartbeated recently."""
+        with self._lock:
+            return time.time() - self.last_heartbeat < self.timeout
+
+    def time_since_heartbeat(self) -> float:
+        """Return seconds since last heartbeat."""
+        with self._lock:
+            return time.time() - self.last_heartbeat
+
+
+def check_memory() -> tuple[int, int]:
+    """
+    Check current memory usage.
+
+    Returns:
+        (used_percent, available_mb)
+    """
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        return mem.percent, mem.available // (1024 * 1024)
+    except ImportError:
+        # psutil not installed, return safe values
+        return 0, 4096
+
+
+def emergency_cleanup() -> None:
+    """Force garbage collection and clear caches to free memory."""
+    logger.warning("[Resource] Performing emergency cleanup")
+    gc.collect()
+    # Clear any module-level caches if possible
+    # Note: whisper model cache is in processor thread, cleared separately
+
+
+def log_resource_status(component: str = "") -> None:
+    """Log current resource usage for debugging."""
+    try:
+        import psutil
+        mem = psutil.virtual_memory()
+        cpu = psutil.cpu_percent(interval=0.1)
+        prefix = f"[{component}] " if component else ""
+        logger.info(f"{prefix}Memory: {mem.percent}% used ({mem.available // (1024*1024)}MB available), CPU: {cpu}%")
+    except ImportError:
+        pass
 
 
 class VoiceActivityDetector:
@@ -145,6 +225,8 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
     """
     import numpy as np
 
+    watchdog = Watchdog(timeout_seconds=WATCHDOG_TIMEOUT)
+
     try:
         vad = VoiceActivityDetector(sample_rate=sample_rate)
     except ImportError as e:
@@ -162,14 +244,28 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
     ]
 
     proc = None
+    memory_check_counter = 0
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         print("[Listener] Listening... (speak to interact)", file=sys.stderr, flush=True)
 
         while not stop_event.is_set():
+            watchdog.heartbeat()
+
             chunk = proc.stdout.read(bytes_per_chunk)
             if not chunk or len(chunk) < bytes_per_chunk:
                 continue
+
+            # Periodic memory check (every ~50 chunks = 5 seconds)
+            memory_check_counter += 1
+            if memory_check_counter >= 50:
+                memory_check_counter = 0
+                mem_percent, _ = check_memory()
+                if mem_percent >= CRITICAL_MEMORY_PERCENT:
+                    logger.warning(f"[Listener] Critical memory: {mem_percent}%, triggering cleanup")
+                    emergency_cleanup()
+                elif mem_percent >= MAX_MEMORY_PERCENT:
+                    logger.warning(f"[Listener] High memory: {mem_percent}%")
 
             # Skip VAD processing while TTS is playing (processing_event set)
             if processing_event.is_set():
@@ -211,6 +307,8 @@ def processor_thread(audio_queue: queue.Queue, stop_event: threading.Event, proc
     """
     import numpy as np
 
+    watchdog = Watchdog(timeout_seconds=WATCHDOG_TIMEOUT)
+
     # Lazy-load whisper model (only when first audio arrives)
     whisper_model = None
 
@@ -226,6 +324,8 @@ def processor_thread(audio_queue: queue.Queue, stop_event: threading.Event, proc
         return whisper_model
 
     while not stop_event.is_set():
+        watchdog.heartbeat()
+
         try:
             audio = audio_queue.get(timeout=0.5)
         except queue.Empty:
@@ -235,6 +335,16 @@ def processor_thread(audio_queue: queue.Queue, stop_event: threading.Event, proc
         processing_event.set()
 
         try:
+            # Check memory before processing
+            mem_percent, mem_available = check_memory()
+            if mem_percent >= CRITICAL_MEMORY_PERCENT:
+                logger.warning(f"[Processor] Critical memory before processing: {mem_percent}%")
+                emergency_cleanup()
+                # Force reload of whisper model if needed
+                whisper_model = None
+            elif mem_percent >= MAX_MEMORY_PERCENT:
+                logger.warning(f"[Processor] High memory before processing: {mem_percent}%")
+
             # Transcribe audio
             print("[Processor] Transcribing...", file=sys.stderr, flush=True)
             model = get_whisper_model()
@@ -287,24 +397,31 @@ def processor_thread(audio_queue: queue.Queue, stop_event: threading.Event, proc
             # Stream LLM response and speak sentence by sentence
             buffer = ""
             try:
-                for chunk in call_llm_stream(text, args.host):
+                for chunk in call_llm_stream(text, args.host, timeout=LLM_TIMEOUT):
+                    watchdog.heartbeat()  # Keep heartbeat during streaming
                     print(chunk, end="", flush=True)
                     buffer += chunk
                     sentences = _split_sentences(buffer)
                     if len(sentences) > 1:
                         to_speak = " ".join(sentences[:-1])
-                        speak(to_speak, args.tts)
+                        speak(to_speak, args.tts, timeout=TTS_TIMEOUT)
                         buffer = sentences[-1]
                 print(flush=True)
                 if buffer.strip():
-                    speak(buffer.strip(), args.tts)
+                    speak(buffer.strip(), args.tts, timeout=TTS_TIMEOUT)
             except Exception as e:
                 print(f"\n[Processor] LLM error: {e}", file=sys.stderr)
                 # Fallback: non-streaming
-                response = call_llm(text, args.host)
-                print(f"Assistant: {response}")
-                if response:
-                    speak(response, args.tts)
+                try:
+                    response = call_llm(text, args.host, timeout=LLM_TIMEOUT)
+                    print(f"Assistant: {response}")
+                    if response:
+                        speak(response, args.tts, timeout=TTS_TIMEOUT)
+                except Exception as e2:
+                    print(f"[Processor] Fallback LLM also failed: {e2}", file=sys.stderr)
+
+            # Log resource status after each turn
+            log_resource_status("Processor")
 
             print()  # Blank line between turns
         finally:
@@ -337,11 +454,28 @@ def run_threaded_assistant(args):
 
     print("\nThreaded voice assistant running. Say 'goodbye' or 'exit' to quit.\n")
 
+    # Health monitoring loop
+    last_health_log = time.time()
+
     try:
-        # Wait for processor to finish (it sets stop_event on exit)
-        processor.join()
+        while processor.is_alive() and listener.is_alive():
+            # Periodic health logging (every 30 seconds)
+            if time.time() - last_health_log > 30:
+                log_resource_status("Health")
+                last_health_log = time.time()
+
+            # Quick sleep to avoid busy waiting
+            time.sleep(0.5)
+
+        # One of the threads died unexpectedly
+        if not processor.is_alive():
+            logger.error("[Health] Processor thread died unexpectedly")
+        if not listener.is_alive():
+            logger.error("[Health] Listener thread died unexpectedly")
+
     except KeyboardInterrupt:
         print("\n[Interrupted]", file=sys.stderr)
+    finally:
         stop_event.set()
         listener.join(timeout=2)
         processor.join(timeout=2)
@@ -586,7 +720,7 @@ def listen(engine: str = None) -> str:
 # LLM Functions
 # ============================================================================
 
-def call_llm(prompt: str, host: str = OLLAMA_HOST) -> str:
+def call_llm(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIMEOUT) -> str:
     try:
         import requests
     except ImportError:
@@ -596,13 +730,13 @@ def call_llm(prompt: str, host: str = OLLAMA_HOST) -> str:
         f"{host}/api/generate",
         json=payload,
         headers={"Content-Type": "application/json"},
-        timeout=120,
+        timeout=timeout,
     )
     r.raise_for_status()
     return r.json().get("response", "").strip()
 
 
-def call_llm_stream(prompt: str, host: str = OLLAMA_HOST):
+def call_llm_stream(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIMEOUT):
     """Yield response chunks as they arrive (Ollama NDJSON stream)."""
     try:
         import requests
@@ -614,7 +748,7 @@ def call_llm_stream(prompt: str, host: str = OLLAMA_HOST):
         json=payload,
         headers={"Content-Type": "application/json"},
         stream=True,
-        timeout=120,
+        timeout=timeout,
     )
     r.raise_for_status()
     for line in r.iter_lines(decode_unicode=True):
@@ -647,7 +781,7 @@ def tts_pyttsx3(text: str) -> None:
     e.runAndWait()
 
 
-def tts_piper(text: str) -> None:
+def tts_piper(text: str, timeout: int = TTS_TIMEOUT) -> None:
     """Use Piper standalone binary; stream output to paplay so playback starts as soon as first chunks are ready."""
     model_path = os.path.join(PIPER_MODEL_DIR, f"{PIPER_VOICE}.onnx")
     config_path = os.path.join(PIPER_MODEL_DIR, f"{PIPER_VOICE}.onnx.json")
@@ -686,8 +820,8 @@ def tts_piper(text: str) -> None:
         piper_proc.stdout.close()
         piper_proc.stdin.write(text.encode("utf-8"))
         piper_proc.stdin.close()
-        piper_proc.wait(timeout=60)
-        paplay_proc.wait(timeout=60)
+        piper_proc.wait(timeout=timeout)
+        paplay_proc.wait(timeout=timeout)
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
         print(f"Piper failed ({e}), using pyttsx3.", file=sys.stderr)
         try:
@@ -703,7 +837,7 @@ _SUPERTONIC_TTS = None
 _SUPERTONIC_STYLE = None
 
 
-def tts_supertonic(text: str) -> None:
+def tts_supertonic(text: str, timeout: int = TTS_TIMEOUT) -> None:
     """Use Supertonic ONNX TTS - higher quality at 44100Hz, optimized for speed.
 
     This runs Supertonic in a subprocess using its virtualenv Python, since
@@ -711,7 +845,7 @@ def tts_supertonic(text: str) -> None:
     """
     if not os.path.isdir(SUPERTONIC_DIR):
         print("Supertonic not found, using piper.", file=sys.stderr)
-        tts_piper(text)
+        tts_piper(text, timeout=timeout)
         return
 
     # Determine the Python interpreter to use
@@ -759,13 +893,13 @@ with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
             [venv_python, "-c", script],
             capture_output=True,
             text=True,
-            timeout=120,
+            timeout=timeout,
             cwd=SUPERTONIC_DIR,
         )
 
         if result.returncode != 0:
             print(f"Supertonic failed: {result.stderr[:100]}, using piper.", file=sys.stderr)
-            tts_piper(text)
+            tts_piper(text, timeout=timeout)
             return
 
         # Get the temp file path (last non-empty line of stdout)
@@ -773,27 +907,27 @@ with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
         wav_path = lines[-1] if lines else None
         if wav_path and wav_path.endswith('.wav') and os.path.exists(wav_path):
             try:
-                subprocess.run(["paplay", wav_path], check=True, timeout=60)
+                subprocess.run(["paplay", wav_path], check=True, timeout=timeout)
             finally:
                 os.unlink(wav_path)
         else:
             print("Supertonic failed to generate audio, using piper.", file=sys.stderr)
-            tts_piper(text)
+            tts_piper(text, timeout=timeout)
 
     except Exception as e:
         print(f"Supertonic failed ({e}), using piper.", file=sys.stderr)
-        tts_piper(text)
+        tts_piper(text, timeout=timeout)
 
 
-def speak(text: str, engine: str = None) -> None:
+def speak(text: str, engine: str = None, timeout: int = TTS_TIMEOUT) -> None:
     """Speak text using specified or default TTS engine."""
     if not text:
         return
     tts = engine or TTS_ENGINE
     if tts == "supertonic":
-        tts_supertonic(text)
+        tts_supertonic(text, timeout=timeout)
     elif tts == "piper":
-        tts_piper(text)
+        tts_piper(text, timeout=timeout)
     else:
         tts_pyttsx3(text)
 

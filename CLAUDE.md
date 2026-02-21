@@ -127,6 +127,15 @@ python3 src/benchmark_latency.py --json > benchmark_results.json
 | `PIPER_BIN` | `~/piper/piper` | Piper binary path |
 | `PIPER_MODEL_DIR` | `~/piper_models` | Voice models directory |
 
+### Resource Guardrails
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `MAX_MEMORY_PERCENT` | `85` | Warn when memory exceeds this % |
+| `CRITICAL_MEMORY_PERCENT` | `95` | Force cleanup at this % |
+| `LLM_TIMEOUT` | `30` | Timeout for LLM requests (seconds) |
+| `TTS_TIMEOUT` | `30` | Timeout for TTS (seconds) |
+| `WATCHDOG_TIMEOUT` | `60` | Max seconds between thread heartbeats |
+
 ## Key Files
 
 - `src/voice_assistant_pi.py` - Main voice assistant with STT → LLM → TTS pipeline. Supports voice and text input.

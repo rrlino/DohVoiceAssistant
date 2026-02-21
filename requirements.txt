@@ -23,3 +23,6 @@ pyttsx3>=2.90
 
 # Note: Piper TTS uses standalone binary, not pip package
 # Install from: https://github.com/rhasspy/piper/releases
+
+# Resource monitoring
+psutil>=5.9.0
