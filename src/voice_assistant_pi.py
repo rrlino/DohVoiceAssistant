@@ -7,11 +7,11 @@ Who processes what:
   - Speech-to-text (your voice → text): faster-whisper or whisper.cpp on Pi CPU
   - Text generation (your prompt → assistant reply): hailo-ollama on port 8000, running on the Hailo-10H
     accelerator (qwen2:1.5b). So the "thinking" and reply text are produced by the Hailo HAT.
-  - Text-to-speech (reply text → audio): Piper TTS runs on the Pi's CPU and plays through the speaker.
+  - Text-to-speech (reply text → audio): Sherpa-ONNX VITS (NEON-optimized) or Piper TTS on Pi CPU.
 
 Usage:
   # Threaded mode (recommended): continuous conversation with Silero VAD
-  python3 voice_assistant_pi.py --threaded --tts piper
+  python3 voice_assistant_pi.py --threaded --tts sherpa
 
   # Voice input (full voice assistant)
   python3 voice_assistant_pi.py --voice
@@ -39,8 +39,8 @@ import wave
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:8000")
 MODEL = os.environ.get("OLLAMA_MODEL", "qwen2:1.5b")
 
-# TTS: "pyttsx3" (espeak, works everywhere), "piper" (smoother), or "supertonic" (fastest, highest quality)
-TTS_ENGINE = os.environ.get("TTS_ENGINE", "piper")
+# TTS: "pyttsx3" (espeak), "piper" (smoother), "sherpa" (fast, NEON-optimized), or "supertonic" (highest quality)
+TTS_ENGINE = os.environ.get("TTS_ENGINE", "sherpa")
 PIPER_MODEL_DIR = os.environ.get("PIPER_MODEL_DIR", os.path.expanduser("~/piper_models"))
 # Medium quality = less robotic than "low". High = most natural: en_US-ryan-high, en_US-amy-high (larger download)
 PIPER_VOICE = os.environ.get("PIPER_VOICE", "en_US-amy-medium")
@@ -53,6 +53,12 @@ PIPER_NOISE_W = os.environ.get("PIPER_NOISE_W", "0.85")
 PIPER_BIN = os.environ.get("PIPER_BIN", os.path.expanduser("~/piper/piper"))
 PIPER_ESPEAK_DATA = os.environ.get("PIPER_ESPEAK_DATA", os.path.expanduser("~/piper/espeak-ng-data"))
 PIPER_LD_LIBRARY_PATH = os.environ.get("PIPER_LD_LIBRARY_PATH", os.path.expanduser("~/piper"))
+
+# Sherpa-ONNX TTS settings (VITS models, NEON-optimized for Pi 5)
+SHERPA_TTS_MODEL = os.environ.get("SHERPA_TTS_MODEL", os.path.expanduser("~/tts-models/vits-piper-en_US-joe-medium"))
+SHERPA_TTS_THREADS = int(os.environ.get("SHERPA_TTS_THREADS", "4"))  # Pi 5 has 4 cores
+SHERPA_TTS_SPEAKER = int(os.environ.get("SHERPA_TTS_SPEAKER", "0"))  # Speaker ID for multi-speaker models
+SHERPA_TTS_SPEED = float(os.environ.get("SHERPA_TTS_SPEED", "1.0"))  # Speech speed (1.0 = normal)
 
 # Supertonic TTS settings
 SUPERTONIC_DIR = os.environ.get("SUPERTONIC_DIR", os.path.expanduser("~/supertonic/py"))
@@ -832,6 +838,98 @@ def tts_piper(text: str, timeout: int = TTS_TIMEOUT) -> None:
         tts_pyttsx3(text)
 
 
+# Global Sherpa-ONNX TTS instance (lazy-loaded)
+_SHERPA_TTS = None
+
+
+def _get_sherpa_tts():
+    """Lazy-load and cache Sherpa-ONNX OfflineTts instance."""
+    global _SHERPA_TTS
+    if _SHERPA_TTS is not None:
+        return _SHERPA_TTS
+    try:
+        import sherpa_onnx
+    except ImportError:
+        return None
+    if not os.path.isdir(SHERPA_TTS_MODEL):
+        return None
+
+    # Find model .onnx file (single-speaker piper or multi-speaker VCTK)
+    onnx_file = None
+    for f in os.listdir(SHERPA_TTS_MODEL):
+        if f.endswith(".onnx") and "int8" not in f:
+            onnx_file = os.path.join(SHERPA_TTS_MODEL, f)
+            break
+    if not onnx_file:
+        return None
+
+    tokens_file = os.path.join(SHERPA_TTS_MODEL, "tokens.txt")
+    data_dir = os.path.join(SHERPA_TTS_MODEL, "espeak-ng-data")
+    lexicon_file = os.path.join(SHERPA_TTS_MODEL, "lexicon.txt")
+
+    config = sherpa_onnx.OfflineTtsConfig()
+    config.model.vits.model = onnx_file
+    config.model.vits.tokens = tokens_file
+    # Prefer system espeak-ng-data — bundled version often mismatches sherpa-onnx
+    # version, causing a C++ error that doesn't raise a Python exception
+    sys_data = "/usr/lib/aarch64-linux-gnu/espeak-ng-data"
+    if os.path.isdir(sys_data):
+        config.model.vits.data_dir = sys_data
+    elif os.path.isdir(data_dir):
+        config.model.vits.data_dir = data_dir
+    if os.path.isfile(lexicon_file):
+        config.model.vits.lexicon = lexicon_file
+    config.model.num_threads = SHERPA_TTS_THREADS
+    config.model.debug = False
+    config.model.provider = "cpu"
+
+    _SHERPA_TTS = sherpa_onnx.OfflineTts(config)
+    logger.info(f"Sherpa-ONNX TTS loaded: {_SHERPA_TTS.sample_rate}Hz, {SHERPA_TTS_THREADS} threads, model={os.path.basename(onnx_file)}")
+    return _SHERPA_TTS
+
+
+def tts_sherpa(text: str, timeout: int = TTS_TIMEOUT) -> None:
+    """Use Sherpa-ONNX VITS TTS — NEON-optimized, targets RTF < 0.1 on Pi 5."""
+    tts = _get_sherpa_tts()
+    if tts is None:
+        logger.warning("Sherpa-ONNX TTS not available, falling back to Piper")
+        tts_piper(text, timeout=timeout)
+        return
+    try:
+        audio = tts.generate(text, sid=SHERPA_TTS_SPEAKER, speed=SHERPA_TTS_SPEED)
+        if not audio.samples:
+            logger.warning("Sherpa-ONNX TTS produced no audio, falling back to Piper")
+            tts_piper(text, timeout=timeout)
+            return
+        # Convert float samples to 16-bit PCM for paplay
+        import array
+        import struct
+        samples = audio.samples
+        if hasattr(samples, 'tobytes'):
+            # numpy array — convert directly
+            import numpy as np
+            pcm_data = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        else:
+            # list of floats — pack manually
+            pcm_data = struct.pack(f'<{len(samples)}h',
+                                   *[int(max(-1.0, min(1.0, s)) * 32767) for s in samples])
+        # Play via aplay (ALSA) or paplay (PulseAudio) — raw PCM s16le
+        player = "paplay" if os.path.isfile("/usr/bin/paplay") else "aplay"
+        if player == "aplay":
+            cmd = [player, "-q", "-t", "raw", "-f", "S16_LE", "-r", str(tts.sample_rate), "-c", "1"]
+        else:
+            cmd = [player, "--raw", f"--rate={tts.sample_rate}", "--format=s16le", "--channels=1"]
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+        proc.communicate(input=pcm_data, timeout=timeout)
+    except Exception as e:
+        logger.warning(f"Sherpa-ONNX TTS failed ({e}), falling back to Piper")
+        tts_piper(text, timeout=timeout)
+
+
 # Global Supertonic instance (lazy-loaded)
 _SUPERTONIC_TTS = None
 _SUPERTONIC_STYLE = None
@@ -926,6 +1024,8 @@ def speak(text: str, engine: str = None, timeout: int = TTS_TIMEOUT) -> None:
     tts = engine or TTS_ENGINE
     if tts == "supertonic":
         tts_supertonic(text, timeout=timeout)
+    elif tts == "sherpa":
+        tts_sherpa(text, timeout=timeout)
     elif tts == "piper":
         tts_piper(text, timeout=timeout)
     else:
@@ -1030,7 +1130,7 @@ def main():
     ap.add_argument("--host", default=OLLAMA_HOST, help="Ollama/hailo-ollama base URL")
     ap.add_argument("--model", default=MODEL, help="Model name")
     ap.add_argument("--once", metavar="TEXT", help="Single prompt (no interactive loop)")
-    ap.add_argument("--tts", choices=("pyttsx3", "piper", "supertonic"), default=TTS_ENGINE, help="TTS engine")
+    ap.add_argument("--tts", choices=("pyttsx3", "piper", "sherpa", "supertonic"), default=TTS_ENGINE, help="TTS engine")
     ap.add_argument("--stt", choices=("faster-whisper", "whisper.cpp", "whisper"), default=STT_ENGINE, help="STT engine")
     ap.add_argument("--no-speak", action="store_true", help="Print response only, no TTS")
     ap.add_argument("--loop", action="store_true", help="Interactive loop: keep prompting until Ctrl+C")

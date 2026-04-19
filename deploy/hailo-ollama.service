@@ -1,0 +1,22 @@
+[Unit]
+Description=Hailo-OLlama LLM Server (qwen2:1.5b on Hailo-10H NPU)
+After=network.target
+Wants=dev-hailo.device
+
+[Service]
+Type=simple
+User=rrlino
+Group=rrlino
+ExecStartPre=/bin/sleep 5
+ExecStart=/usr/bin/hailo-ollama
+Restart=on-failure
+RestartSec=10
+Environment=HOME=/home/rrlino
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hailo-ollama
+
+[Install]
+WantedBy=multi-user.target

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Compare TTS engines: Piper vs Supertonic on Raspberry Pi 5.
+Compare TTS engines: Piper vs Sherpa-ONNX vs Supertonic on Raspberry Pi 5.
 
 Usage:
     python3 src/benchmark_tts_comparison.py
@@ -202,9 +202,64 @@ else:
         return {"error": str(e)}
 
 
+def benchmark_sherpa(text: str, iterations: int = 3) -> dict:
+    """Benchmark Sherpa-ONNX VITS TTS."""
+    try:
+        import sherpa_onnx
+    except ImportError:
+        return {"error": "sherpa-onnx not installed"}
+
+    model_dir = os.environ.get("SHERPA_TTS_MODEL", os.path.expanduser("~/tts-models/vits-vctk-onnx"))
+    num_threads = int(os.environ.get("SHERPA_TTS_THREADS", "4"))
+
+    if not os.path.isdir(model_dir):
+        return {"error": f"Sherpa model not found at {model_dir}"}
+
+    try:
+        tts = sherpa_onnx.OfflineTts(
+            model=model_dir,
+            num_threads=num_threads,
+            debug=False,
+            provider="cpu",
+        )
+    except Exception as e:
+        return {"error": f"Failed to load model: {e}"}
+
+    times = []
+    durations = []
+
+    for _ in range(iterations):
+        try:
+            start = time.perf_counter()
+            audio = tts.generate(text, sid=0, speed=1.0)
+            elapsed = time.perf_counter() - start
+
+            samples = audio.samples
+            if hasattr(samples, '__len__') and len(samples) > 0:
+                duration = len(samples) / tts.sample_rate
+                times.append(elapsed)
+                durations.append(duration)
+        except Exception as e:
+            return {"error": str(e)}
+
+    if not times:
+        return {"error": "No successful runs"}
+
+    avg_time = sum(times) / len(times)
+    avg_duration = sum(durations) / len(durations)
+    rtf = avg_time / avg_duration if avg_duration > 0 else 0
+
+    return {
+        "generation_ms": round(avg_time * 1000),
+        "audio_duration_s": round(avg_duration, 2),
+        "rtf": round(rtf, 3),
+        "sample_rate": tts.sample_rate,
+    }
+
+
 def main():
     print("=" * 70)
-    print("TTS Engine Comparison: Piper vs Supertonic on Raspberry Pi 5")
+    print("TTS Engine Comparison: Piper vs Sherpa-ONNX vs Supertonic on Pi 5")
     print("=" * 70)
     print()
 
@@ -214,15 +269,23 @@ def main():
         print("-" * 50)
 
         # Piper
-        print("  Piper:     ", end="", flush=True)
+        print("  Piper:      ", end="", flush=True)
         piper_result = benchmark_piper(text)
         if "error" in piper_result:
             print(f"ERROR - {piper_result['error']}")
         else:
             print(f"{piper_result['generation_ms']}ms, {piper_result['audio_duration_s']}s audio, RTF={piper_result['rtf']}")
 
+        # Sherpa-ONNX
+        print("  Sherpa-ONNX:", end="", flush=True)
+        sherpa_result = benchmark_sherpa(text)
+        if "error" in sherpa_result:
+            print(f"ERROR - {sherpa_result['error']}")
+        else:
+            print(f"{sherpa_result['generation_ms']}ms, {sherpa_result['audio_duration_s']}s audio, RTF={sherpa_result['rtf']}")
+
         # Supertonic
-        print("  Supertonic:", end="", flush=True)
+        print("  Supertonic: ", end="", flush=True)
         super_result = benchmark_supertonic(text)
         if "error" in super_result:
             print(f"ERROR - {super_result['error']}")
@@ -235,10 +298,11 @@ def main():
     print("Summary")
     print("=" * 70)
     print()
-    print("| Engine     | Quality    | RTF Target | Pros                          |")
-    print("|------------|------------|------------|-------------------------------|")
-    print("| Piper      | 22050Hz    | ~0.13-0.26 | Fast, many voices, mature     |")
-    print("| Supertonic | 44100Hz    | ~0.14      | Higher quality, modern ONNX   |")
+    print("| Engine      | Quality    | RTF Target | Pros                              |")
+    print("|-------------|------------|------------|-----------------------------------|")
+    print("| Piper       | 22050Hz    | ~0.13-0.26 | Many voices, mature               |")
+    print("| Sherpa-ONNX | 22050Hz    | ~0.05-0.10 | NEON-optimized, fastest on ARM    |")
+    print("| Supertonic  | 44100Hz    | ~0.14      | Higher quality, modern ONNX       |")
     print()
 
 

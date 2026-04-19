@@ -1,0 +1,31 @@
+[Unit]
+Description=Doh Voice Assistant (STT -> LLM -> TTS pipeline)
+After=network.target hailo-ollama.service sound.target
+Wants=hailo-ollama.service
+Requires=sound.target
+
+[Service]
+Type=simple
+User=rrlino
+Group=rrlino
+WorkingDirectory=/home/rrlino/DohVoiceAssistant
+ExecStartPre=/bin/sleep 15
+ExecStart=/home/rrlino/DohVoiceAssistant/.venv/bin/python3 /home/rrlino/DohVoiceAssistant/src/voice_assistant_pi.py --threaded --tts sherpa
+Restart=on-failure
+RestartSec=15
+StartLimitIntervalSec=120
+StartLimitBurst=5
+
+# Resource limits
+MemoryMax=2G
+Environment=HOME=/home/rrlino
+Environment=SHERPA_TTS_MODEL=/home/rrlino/tts-models/vits-piper-en_US-joe-medium
+Environment=OLLAMA_HOST=http://127.0.0.1:8000
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=doh-voice
+
+[Install]
+WantedBy=multi-user.target

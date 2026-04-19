@@ -10,13 +10,13 @@ Privacy-first offline voice assistant running on Raspberry Pi 5 + Hailo-10H AI H
 
 ### Single-Thread (Basic)
 ```
-User Voice → [faster-whisper STT on Pi CPU] → [Qwen LLM on Hailo-10H] → [Piper TTS on Pi CPU] → Speaker
+User Voice → [faster-whisper STT on Pi CPU] → [Qwen LLM on Hailo-10H] → [Sherpa-ONNX TTS on Pi CPU] → Speaker
 ```
 
 ### 2-Thread (Recommended for Natural Conversation)
 ```
 Thread 1 (Listener):  Mic → [Silero VAD] → Audio Queue
-Thread 2 (Processor): Queue → [faster-whisper] → [hailo-ollama] → [Piper TTS] → Speaker
+Thread 2 (Processor): Queue → [faster-whisper] → [hailo-ollama] → [Sherpa-ONNX TTS] → Speaker
 ```
 
 | Component | Technology | Hardware | Why |
@@ -24,7 +24,7 @@ Thread 2 (Processor): Queue → [faster-whisper] → [hailo-ollama] → [Piper T
 | VAD | Silero (sherpa-onnx) | Pi 5 CPU | 92% accuracy, <1ms latency |
 | STT | faster-whisper (tiny.en) | Pi 5 CPU | Fast transcription, works well on ARM |
 | LLM | hailo-ollama (Qwen 2:1.5B) | Hailo-10H | Accelerated inference |
-| TTS | Piper | Pi 5 CPU | Hailo can't do 1D convolutions needed for audio synthesis |
+| TTS | Sherpa-ONNX VITS (default) / Piper (fallback) | Pi 5 CPU | NEON-optimized, RTF < 0.1 on Pi 5 |
 
 ## Setup (One-time)
 
@@ -50,7 +50,7 @@ aplay -l    # Should show "ReSpeaker Lite"
 ### Voice Assistant (with microphone)
 ```bash
 # 2-thread mode (recommended): continuous listening with Silero VAD
-python3 src/voice_assistant_pi.py --threaded --tts piper
+python3 src/voice_assistant_pi.py --threaded --tts sherpa
 
 # Basic voice mode - fixed 5s recording per turn
 python3 src/voice_assistant_pi.py --voice
@@ -62,7 +62,7 @@ python3 src/voice_assistant_pi.py --voice --wake
 ### Text Input Modes
 ```bash
 # Text chat with spoken replies
-python3 src/voice_assistant_pi.py --tts piper --loop
+python3 src/voice_assistant_pi.py --tts sherpa --loop
 
 # Single query
 python3 src/voice_assistant_pi.py --once "What time is it?"
@@ -122,8 +122,12 @@ python3 src/benchmark_latency.py --json > benchmark_results.json
 ### TTS Configuration
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `TTS_ENGINE` | `piper` | `pyttsx3`, `piper`, or `supertonic` |
-| `PIPER_VOICE` | `en_US-amy-medium` | Piper voice name |
+| `TTS_ENGINE` | `sherpa` | `pyttsx3`, `piper`, `sherpa`, or `supertonic` |
+| `SHERPA_TTS_MODEL` | `~/tts-models/vits-piper-en_US-joe-medium` | Sherpa-ONNX VITS model directory |
+| `SHERPA_TTS_THREADS` | `4` | Number of CPU threads (Pi 5 has 4 cores) |
+| `SHERPA_TTS_SPEAKER` | `0` | Speaker ID for multi-speaker models |
+| `SHERPA_TTS_SPEED` | `1.0` | Speech speed (1.0 = normal) |
+| `PIPER_VOICE` | `en_US-amy-medium` | Piper voice name (fallback) |
 | `PIPER_BIN` | `~/piper/piper` | Piper binary path |
 | `PIPER_MODEL_DIR` | `~/piper_models` | Voice models directory |
 
@@ -140,7 +144,7 @@ python3 src/benchmark_latency.py --json > benchmark_results.json
 
 - `src/voice_assistant_pi.py` - Main voice assistant with STT → LLM → TTS pipeline. Supports voice and text input.
 - `src/benchmark_latency.py` - Latency benchmarking script. Measures LLM TTFT, TTS RTF, and full turn latency.
-- `src/benchmark_tts_comparison.py` - Compare Piper vs Supertonic TTS performance.
+- `src/benchmark_tts_comparison.py` - Compare Piper vs Sherpa-ONNX vs Supertonic TTS performance.
 - `src/test_pi_qwen.py` - Test harness for hailo-ollama API from remote machine.
 - `requirements.txt` - Python dependencies for the voice assistant.
 
@@ -163,8 +167,23 @@ pip3 install -r requirements.txt
 System dependencies (on Pi):
 - `hailort` - Hailo runtime
 - `hailo-ollama` - LLM server
-- Piper binary + voice models at `~/piper/` and `~/piper_models/`
+- Sherpa-ONNX VITS models at `~/tts-models/vits-piper-en_US-joe-medium/` (default TTS)
+- Piper binary + voice models at `~/piper/` and `~/piper_models/` (fallback TTS)
 - PulseAudio for audio I/O
+
+### Sherpa-ONNX TTS Setup (on Pi)
+```bash
+# Download VITS model (multi-speaker, 109 voices, ~44MB)
+mkdir -p ~/tts-models && cd ~/tts-models
+wget https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-vctk.tar.bz2
+tar xvf vits-vctk.tar.bz2
+
+# Or: single female voice (~36MB)
+# wget https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-ljspeech-onnx.tar.bz2
+
+# Verify (sherpa-onnx is already installed via requirements.txt)
+python3 -c "import sherpa_onnx; tts = sherpa_onnx.OfflineTts(model='$HOME/tts-models/vits-vctk-onnx', num_threads=4, debug=False, provider='cpu'); print(f'OK: {tts.sample_rate}Hz')"
+```
 
 ## Hardware Notes
 
