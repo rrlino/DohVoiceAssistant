@@ -236,18 +236,40 @@ class WakeWordDetector:
         bpe_tokens = self._tokenize_keyword(keyword, bpe_model)
         logger.info(f"Wake word BPE tokens: {bpe_tokens}")
 
-        # Write keywords file with boosting and threshold
+        # Write keywords file with BPE tokens and boosting
         keywords_file = os.path.join(model_dir, "keywords_active.txt")
         with open(keywords_file, "w") as f:
             f.write(f"{bpe_tokens} :1.5 #{threshold}\n")
 
+        # Find model files (prefer int8 for lower CPU)
+        encoder = self._find_model(model_dir, "encoder")
+        decoder = self._find_model(model_dir, "decoder")
+        joiner = self._find_model(model_dir, "joiner")
+        tokens = os.path.join(model_dir, "tokens.txt")
+
         self.kws = sherpa_onnx.KeywordSpotter(
-            model=model_dir,
+            tokens=tokens,
+            encoder=encoder,
+            decoder=decoder,
+            joiner=joiner,
             keywords_file=keywords_file,
+            num_threads=2,
+            keywords_threshold=threshold,
         )
         self.sample_rate = sample_rate
         self.stream = self.kws.create_stream()
         logger.info(f"Wake word detector loaded: '{keyword}' (threshold={threshold})")
+
+    @staticmethod
+    def _find_model(model_dir: str, prefix: str) -> str:
+        """Find ONNX model file, preferring int8."""
+        for f in os.listdir(model_dir):
+            if f.startswith(prefix) and f.endswith(".int8.onnx"):
+                return os.path.join(model_dir, f)
+        for f in os.listdir(model_dir):
+            if f.startswith(prefix) and f.endswith(".onnx"):
+                return os.path.join(model_dir, f)
+        raise FileNotFoundError(f"No {prefix} ONNX file in {model_dir}")
 
     @staticmethod
     def _tokenize_keyword(keyword: str, bpe_model_path: str) -> str:
@@ -259,7 +281,6 @@ class WakeWordDetector:
             tokens = sp.encode(keyword.upper(), out_type=str)
             return " ".join(tokens)
         except ImportError:
-            # Fallback: return uppercase (won't work with KWS but won't crash)
             return keyword.upper()
 
     def process(self, samples) -> bool:
@@ -270,12 +291,14 @@ class WakeWordDetector:
         else:
             self.stream.accept_waveform(self.sample_rate, list(samples))
 
-        result = self.kws.decode_stream(self.stream)
-        if result.keyword:
-            logger.info(f"Wake word detected: '{result.keyword}'")
-            # Reset stream after detection
-            self.stream = self.kws.create_stream()
-            return True
+        # Decode available frames and check for keyword
+        while self.kws.is_ready(self.stream):
+            self.kws.decode_stream(self.stream)
+            keyword = self.kws.get_result(self.stream)
+            if keyword:
+                logger.info(f"Wake word detected: '{keyword}'")
+                self.stream = self.kws.create_stream()
+                return True
         return False
 
     def reset(self):
