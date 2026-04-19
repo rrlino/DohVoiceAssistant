@@ -18,6 +18,9 @@ webrtcvad>=2.0.10
 # Silero VAD via sherpa-onnx (more accurate than webrtcvad)
 sherpa-onnx>=1.10.0
 
+# Wake word keyword spotting (BPE tokenization for sherpa-onnx KWS)
+sentencepiece>=0.1.99
+
 # TTS: pyttsx3 (fallback, robotic voice)
 pyttsx3>=2.90
 

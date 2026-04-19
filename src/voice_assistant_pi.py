@@ -60,6 +60,11 @@ SHERPA_TTS_THREADS = int(os.environ.get("SHERPA_TTS_THREADS", "4"))  # Pi 5 has 
 SHERPA_TTS_SPEAKER = int(os.environ.get("SHERPA_TTS_SPEAKER", "0"))  # Speaker ID for multi-speaker models
 SHERPA_TTS_SPEED = float(os.environ.get("SHERPA_TTS_SPEED", "1.0"))  # Speech speed (1.0 = normal)
 
+# Wake word settings (sherpa-onnx KeywordSpotter)
+KWS_MODEL = os.environ.get("KWS_MODEL", os.path.expanduser("~/tts-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"))
+KWS_KEYWORD = os.environ.get("KWS_KEYWORD", "hey homer")  # Wake word phrase
+KWS_THRESHOLD = float(os.environ.get("KWS_THRESHOLD", "0.5"))  # Detection threshold (lower = more sensitive)
+
 # Supertonic TTS settings
 SUPERTONIC_DIR = os.environ.get("SUPERTONIC_DIR", os.path.expanduser("~/supertonic/py"))
 SUPERTONIC_VOICE = os.environ.get("SUPERTONIC_VOICE", "M1")  # Options: M1, M2, F1, F2
@@ -81,6 +86,7 @@ VAD_THRESHOLD = float(os.environ.get("VAD_THRESHOLD", "0.5"))  # Voice activity 
 MAX_MEMORY_PERCENT = int(os.environ.get("MAX_MEMORY_PERCENT", "85"))  # Warn at this % memory usage
 CRITICAL_MEMORY_PERCENT = int(os.environ.get("CRITICAL_MEMORY_PERCENT", "95"))  # Force cleanup at this %
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "30"))  # Timeout for LLM requests (seconds)
+LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "80"))  # Max output tokens (prevents PCIe DMA hang on Pi 5 + Hailo x1)
 TTS_TIMEOUT = int(os.environ.get("TTS_TIMEOUT", "30"))  # Timeout for TTS (seconds)
 WATCHDOG_TIMEOUT = int(os.environ.get("WATCHDOG_TIMEOUT", "60"))  # Max seconds between heartbeats
 
@@ -216,17 +222,79 @@ class VoiceActivityDetector:
             self.vad.pop()
 
 
+class WakeWordDetector:
+    """Detects a wake word using sherpa-onnx KeywordSpotter (streaming)."""
+
+    def __init__(self, model_dir: str = KWS_MODEL, keyword: str = KWS_KEYWORD,
+                 threshold: float = KWS_THRESHOLD, sample_rate: int = 16000):
+        import sherpa_onnx
+        if not os.path.isdir(model_dir):
+            raise FileNotFoundError(f"KWS model not found at {model_dir}")
+
+        # Convert keyword to BPE tokens using the model's sentencepiece
+        bpe_model = os.path.join(model_dir, "bpe.model")
+        bpe_tokens = self._tokenize_keyword(keyword, bpe_model)
+        logger.info(f"Wake word BPE tokens: {bpe_tokens}")
+
+        # Write keywords file with boosting and threshold
+        keywords_file = os.path.join(model_dir, "keywords_active.txt")
+        with open(keywords_file, "w") as f:
+            f.write(f"{bpe_tokens} :1.5 #{threshold}\n")
+
+        self.kws = sherpa_onnx.KeywordSpotter(
+            model=model_dir,
+            keywords_file=keywords_file,
+        )
+        self.sample_rate = sample_rate
+        self.stream = self.kws.create_stream()
+        logger.info(f"Wake word detector loaded: '{keyword}' (threshold={threshold})")
+
+    @staticmethod
+    def _tokenize_keyword(keyword: str, bpe_model_path: str) -> str:
+        """Convert keyword to BPE tokens using sentencepiece."""
+        try:
+            import sentencepiece as spm
+            sp = spm.SentencePieceProcessor()
+            sp.load(bpe_model_path)
+            tokens = sp.encode(keyword.upper(), out_type=str)
+            return " ".join(tokens)
+        except ImportError:
+            # Fallback: return uppercase (won't work with KWS but won't crash)
+            return keyword.upper()
+
+    def process(self, samples) -> bool:
+        """Process audio chunk. Returns True if wake word detected."""
+        import numpy as np
+        if isinstance(samples, np.ndarray):
+            self.stream.accept_waveform(self.sample_rate, samples.tolist())
+        else:
+            self.stream.accept_waveform(self.sample_rate, list(samples))
+
+        result = self.kws.decode_stream(self.stream)
+        if result.keyword:
+            logger.info(f"Wake word detected: '{result.keyword}'")
+            # Reset stream after detection
+            self.stream = self.kws.create_stream()
+            return True
+        return False
+
+    def reset(self):
+        """Reset detector state."""
+        self.stream = self.kws.create_stream()
+
+
 # ============================================================================
 # Threaded Voice Assistant
 # ============================================================================
 
-def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, processing_event: threading.Event, sample_rate: int = 16000):
+def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, processing_event: threading.Event, sample_rate: int = 16000, wake_mode: bool = False):
     """
     Thread 1: Continuously listen for speech using Silero VAD.
 
     Records audio in chunks, detects speech via VAD, and puts complete
     speech segments into the audio queue for processing.
 
+    In wake mode: only starts VAD after wake word ("hey homer") is detected.
     Skips detection when processing_event is set (TTS is playing).
     """
     import numpy as np
@@ -238,6 +306,16 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
     except ImportError as e:
         print(f"[Listener] Failed to init VAD: {e}", file=sys.stderr)
         return
+
+    # Initialize wake word detector if in wake mode
+    wake_detector = None
+    if wake_mode:
+        try:
+            wake_detector = WakeWordDetector(sample_rate=sample_rate)
+            print(f"[Listener] Say '{KWS_KEYWORD}' to activate", file=sys.stderr, flush=True)
+        except (ImportError, FileNotFoundError) as e:
+            print(f"[Listener] Wake word unavailable ({e}), falling back to always-listening", file=sys.stderr)
+            wake_mode = False
 
     chunk_duration = 0.1  # 100ms chunks
     chunk_size = int(sample_rate * chunk_duration)  # samples per chunk
@@ -276,10 +354,19 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
             # Skip VAD processing while TTS is playing (processing_event set)
             if processing_event.is_set():
                 vad.reset()  # Clear VAD buffer to avoid stale audio
+                if wake_detector:
+                    wake_detector.reset()
                 continue
 
             # Convert to float32 normalized to [-1, 1]
             samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+
+            # Wake word mode: only process VAD after wake word detected
+            if wake_mode and wake_detector:
+                if wake_detector.process(samples):
+                    print(f"[Listener] Wake word '{KWS_KEYWORD}' detected!", file=sys.stderr, flush=True)
+                    vad.reset()
+                continue
 
             # Process through VAD
             speech = vad.process(samples)
@@ -403,7 +490,7 @@ def processor_thread(audio_queue: queue.Queue, stop_event: threading.Event, proc
             # Stream LLM response and speak sentence by sentence
             buffer = ""
             try:
-                for chunk in call_llm_stream(text, args.host, timeout=LLM_TIMEOUT):
+                for chunk in call_llm_stream(text, args.host, timeout=LLM_TIMEOUT, max_tokens=args.max_tokens):
                     watchdog.heartbeat()  # Keep heartbeat during streaming
                     print(chunk, end="", flush=True)
                     buffer += chunk
@@ -419,7 +506,7 @@ def processor_thread(audio_queue: queue.Queue, stop_event: threading.Event, proc
                 print(f"\n[Processor] LLM error: {e}", file=sys.stderr)
                 # Fallback: non-streaming
                 try:
-                    response = call_llm(text, args.host, timeout=LLM_TIMEOUT)
+                    response = call_llm(text, args.host, timeout=LLM_TIMEOUT, max_tokens=args.max_tokens)
                     print(f"Assistant: {response}")
                     if response:
                         speak(response, args.tts, timeout=TTS_TIMEOUT)
@@ -441,9 +528,11 @@ def run_threaded_assistant(args):
     stop_event = threading.Event()
     processing_event = threading.Event()  # Set when processing to mute listener
 
+    wake_mode = getattr(args, 'wake', False)
+
     listener = threading.Thread(
         target=listener_thread,
-        args=(audio_queue, stop_event, processing_event, AUDIO_SAMPLE_RATE),
+        args=(audio_queue, stop_event, processing_event, AUDIO_SAMPLE_RATE, wake_mode),
         name="ListenerThread"
     )
     processor = threading.Thread(
@@ -726,12 +815,14 @@ def listen(engine: str = None) -> str:
 # LLM Functions
 # ============================================================================
 
-def call_llm(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIMEOUT) -> str:
+def call_llm(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIMEOUT,
+             max_tokens: int = None) -> str:
     try:
         import requests
     except ImportError:
         sys.exit("pip install requests")
-    payload = {"model": MODEL, "prompt": prompt, "stream": False}
+    payload = {"model": MODEL, "prompt": prompt, "stream": False,
+               "options": {"num_predict": max_tokens or LLM_MAX_TOKENS}}
     r = requests.post(
         f"{host}/api/generate",
         json=payload,
@@ -742,13 +833,15 @@ def call_llm(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIMEOUT) -
     return r.json().get("response", "").strip()
 
 
-def call_llm_stream(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIMEOUT):
+def call_llm_stream(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIMEOUT,
+                    max_tokens: int = None):
     """Yield response chunks as they arrive (Ollama NDJSON stream)."""
     try:
         import requests
     except ImportError:
         sys.exit("pip install requests")
-    payload = {"model": MODEL, "prompt": prompt, "stream": True}
+    payload = {"model": MODEL, "prompt": prompt, "stream": True,
+               "options": {"num_predict": max_tokens or LLM_MAX_TOKENS}}
     r = requests.post(
         f"{host}/api/generate",
         json=payload,
@@ -1129,23 +1222,20 @@ def main():
     ap = argparse.ArgumentParser(description="Voice assistant: STT → LLM → TTS")
     ap.add_argument("--host", default=OLLAMA_HOST, help="Ollama/hailo-ollama base URL")
     ap.add_argument("--model", default=MODEL, help="Model name")
+    ap.add_argument("--max-tokens", type=int, default=LLM_MAX_TOKENS, help="Max LLM output tokens (default: %(default)s)")
     ap.add_argument("--once", metavar="TEXT", help="Single prompt (no interactive loop)")
     ap.add_argument("--tts", choices=("pyttsx3", "piper", "sherpa", "supertonic"), default=TTS_ENGINE, help="TTS engine")
     ap.add_argument("--stt", choices=("faster-whisper", "whisper.cpp", "whisper"), default=STT_ENGINE, help="STT engine")
     ap.add_argument("--no-speak", action="store_true", help="Print response only, no TTS")
     ap.add_argument("--loop", action="store_true", help="Interactive loop: keep prompting until Ctrl+C")
     ap.add_argument("--voice", action="store_true", help="Voice input mode: use microphone for input")
-    ap.add_argument("--wake", action="store_true", help="Wake word mode: listen for 'assistant' before each query (implies --voice)")
+    ap.add_argument("--wake", action="store_true", help="Wake word mode: listen for 'hey homer' before each query")
     ap.add_argument("--threaded", action="store_true", help="2-thread mode: continuous VAD listening with parallel processing")
     ap.add_argument("--record", metavar="SECONDS", type=float, help="Record audio for N seconds and save to /tmp/recording.wav")
     ap.add_argument("--transcribe", metavar="FILE", help="Transcribe audio file to text (no LLM)")
     ap.add_argument("--read", action="store_true", help="Read-only mode: speak text from stdin, no LLM")
     ap.add_argument("--read-file", metavar="PATH", help="Speak contents of file, no LLM")
     args = ap.parse_args()
-
-    # Wake mode implies voice mode
-    if args.wake:
-        args.voice = True
 
     # Read-only TTS: speak text from file or stdin, no LLM
     if args.read_file or args.read:
@@ -1190,7 +1280,7 @@ def main():
             return
         print("Thinking...")
         if args.no_speak:
-            for chunk in call_llm_stream(prompt.strip(), args.host):
+            for chunk in call_llm_stream(prompt.strip(), args.host, max_tokens=args.max_tokens):
                 print(chunk, end="", flush=True)
             print()
             return
@@ -1198,7 +1288,7 @@ def main():
         buffer = ""
         print("Assistant:", end="", flush=True)
         try:
-            for chunk in call_llm_stream(prompt.strip(), args.host):
+            for chunk in call_llm_stream(prompt.strip(), args.host, max_tokens=args.max_tokens):
                 print(chunk, end="", flush=True)
                 buffer += chunk
                 sentences = _split_sentences(buffer)
@@ -1212,7 +1302,7 @@ def main():
         except Exception as e:
             print(f"\nStream error: {e}", file=sys.stderr)
             # Fallback: get full response and speak once
-            response = call_llm(prompt.strip(), args.host)
+            response = call_llm(prompt.strip(), args.host, max_tokens=args.max_tokens)
             print("Assistant:", response)
             if response:
                 speak(response, args.tts)
