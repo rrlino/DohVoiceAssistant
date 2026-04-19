@@ -291,8 +291,8 @@ class WakeWordDetector:
         else:
             self.stream.accept_waveform(self.sample_rate, list(samples))
 
-        # Decode available frames and check for keyword
-        while self.kws.is_ready(self.stream):
+        # Check if enough frames are ready, decode once per chunk
+        if self.kws.is_ready(self.stream):
             self.kws.decode_stream(self.stream)
             keyword = self.kws.get_result(self.stream)
             if keyword:
@@ -335,7 +335,6 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
     if wake_mode:
         try:
             wake_detector = WakeWordDetector(sample_rate=sample_rate)
-            print(f"[Listener] Say '{KWS_KEYWORD}' to activate", file=sys.stderr, flush=True)
         except (ImportError, FileNotFoundError) as e:
             print(f"[Listener] Wake word unavailable ({e}), falling back to always-listening", file=sys.stderr)
             wake_mode = False
@@ -352,9 +351,13 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
 
     proc = None
     memory_check_counter = 0
+    waiting_for_wake = wake_mode and wake_detector is not None  # Start in wake mode if enabled
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        print("[Listener] Listening... (speak to interact)", file=sys.stderr, flush=True)
+        if waiting_for_wake:
+            print(f"[Listener] Say '{KWS_KEYWORD}' to activate", file=sys.stderr, flush=True)
+        else:
+            print("[Listener] Listening... (speak to interact)", file=sys.stderr, flush=True)
 
         while not stop_event.is_set():
             watchdog.heartbeat()
@@ -376,18 +379,22 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
 
             # Skip VAD processing while TTS is playing (processing_event set)
             if processing_event.is_set():
-                vad.reset()  # Clear VAD buffer to avoid stale audio
+                vad.reset()
                 if wake_detector:
                     wake_detector.reset()
+                # After TTS finishes, go back to wake word listening
+                if wake_mode and wake_detector:
+                    waiting_for_wake = True
                 continue
 
             # Convert to float32 normalized to [-1, 1]
             samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
 
-            # Wake word mode: only process VAD after wake word detected
-            if wake_mode and wake_detector:
+            # Wake word mode: listen for keyword before accepting speech
+            if waiting_for_wake and wake_detector:
                 if wake_detector.process(samples):
                     print(f"[Listener] Wake word '{KWS_KEYWORD}' detected!", file=sys.stderr, flush=True)
+                    waiting_for_wake = False
                     vad.reset()
                 continue
 
