@@ -343,17 +343,39 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
     chunk_size = int(sample_rate * chunk_duration)  # samples per chunk
     bytes_per_chunk = chunk_size * 2  # 16-bit = 2 bytes per sample
 
-    # Start recording from default microphone
-    cmd = [
-        "parecord", "--device=@DEFAULT_SOURCE@", "--raw",
-        f"--rate={sample_rate}", "--channels=1", "--format=s16le"
-    ]
+    # Try sounddevice first (works in background/daemon mode)
+    use_sounddevice = False
+    try:
+        import sounddevice as sd
+        # Test that it can open the mic
+        test_stream = sd.InputStream(samplerate=sample_rate, channels=1, dtype='int16',
+                                      blocksize=chunk_size)
+        test_stream.close()
+        use_sounddevice = True
+        logger.info("Using sounddevice for audio capture")
+    except (ImportError, Exception):
+        pass
+
+    if not use_sounddevice:
+        # Fallback: parecord subprocess (may not work in daemon mode)
+        cmd = [
+            "parecord", "--device=@DEFAULT_SOURCE@", "--raw",
+            f"--rate={sample_rate}", "--channels=1", "--format=s16le"
+        ]
 
     proc = None
+    sd_stream = None
     memory_check_counter = 0
     waiting_for_wake = wake_mode and wake_detector is not None  # Start in wake mode if enabled
     try:
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        if use_sounddevice:
+            import sounddevice as sd
+            sd_stream = sd.InputStream(samplerate=sample_rate, channels=1, dtype='int16',
+                                       blocksize=chunk_size)
+            sd_stream.start()
+        else:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                    bufsize=0)  # Unbuffered
         if waiting_for_wake:
             print(f"[Listener] Say '{KWS_KEYWORD}' to activate", file=sys.stderr, flush=True)
         else:
@@ -362,7 +384,18 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
         while not stop_event.is_set():
             watchdog.heartbeat()
 
-            chunk = proc.stdout.read(bytes_per_chunk)
+            # Read audio chunk
+            if use_sounddevice and sd_stream:
+                frames, _ = sd_stream.read(chunk_size)
+                if frames is None or len(frames) == 0:
+                    continue
+                chunk = frames.flatten().tobytes()
+            else:
+                import select
+                ready, _, _ = select.select([proc.stdout], [], [], 1.0)
+                if not ready:
+                    continue
+                chunk = os.read(proc.stdout.fileno(), bytes_per_chunk)
             if not chunk or len(chunk) < bytes_per_chunk:
                 continue
 
@@ -396,6 +429,14 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
                     print(f"[Listener] Wake word '{KWS_KEYWORD}' detected!", file=sys.stderr, flush=True)
                     waiting_for_wake = False
                     vad.reset()
+                    # Play short beep to confirm wake word heard
+                    try:
+                        subprocess.Popen(["aplay", "-q", "-t", "raw", "-f", "S16_LE",
+                                         "-r", "16000", "-c", "1"],
+                                        stdin=subprocess.PIPE, stderr=subprocess.DEVNULL
+                                        ).communicate(input=b'\x00\xff' * 800, timeout=1)
+                    except Exception:
+                        pass
                 continue
 
             # Process through VAD
@@ -413,6 +454,9 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
     except Exception as e:
         print(f"[Listener] Error: {e}", file=sys.stderr)
     finally:
+        if sd_stream:
+            sd_stream.stop()
+            sd_stream.close()
         if proc:
             proc.terminate()
             try:
