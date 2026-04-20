@@ -64,6 +64,8 @@ SHERPA_TTS_SPEED = float(os.environ.get("SHERPA_TTS_SPEED", "1.0"))  # Speech sp
 KWS_MODEL = os.environ.get("KWS_MODEL", os.path.expanduser("~/tts-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"))
 KWS_KEYWORD = os.environ.get("KWS_KEYWORD", "hey homer")  # Wake word phrase
 KWS_THRESHOLD = float(os.environ.get("KWS_THRESHOLD", "0.5"))  # Detection threshold (lower = more sensitive)
+POST_WAKE_GRACE_MS = int(os.environ.get("POST_WAKE_GRACE_MS", "1500"))  # Discard audio after wake word (avoid echo)
+CONVERSATION_HOLD_S = int(os.environ.get("CONVERSATION_HOLD_S", "10"))  # Stay listening after response before returning to wake word
 
 # Supertonic TTS settings
 SUPERTONIC_DIR = os.environ.get("SUPERTONIC_DIR", os.path.expanduser("~/supertonic/py"))
@@ -367,6 +369,8 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
     sd_stream = None
     memory_check_counter = 0
     waiting_for_wake = wake_mode and wake_detector is not None  # Start in wake mode if enabled
+    post_wake_grace_chunks = 0  # Counter: discard audio chunks after wake word detection
+    conversation_hold_until = 0  # Timestamp: stay listening (no wake word) until this time
     try:
         if use_sounddevice:
             import sounddevice as sd
@@ -415,9 +419,10 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
                 vad.reset()
                 if wake_detector:
                     wake_detector.reset()
-                # After TTS finishes, go back to wake word listening
+                # After TTS finishes, stay in conversation mode for CONVERSATION_HOLD_S seconds
+                # before returning to wake word listening
                 if wake_mode and wake_detector:
-                    waiting_for_wake = True
+                    conversation_hold_until = time.monotonic() + CONVERSATION_HOLD_S
                 continue
 
             # Convert to float32 normalized to [-1, 1]
@@ -429,6 +434,10 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
                     print(f"[Listener] Wake word '{KWS_KEYWORD}' detected!", file=sys.stderr, flush=True)
                     waiting_for_wake = False
                     vad.reset()
+                    # Start grace period: discard next N chunks to avoid capturing wake word echo/beep
+                    chunks_per_ms = sample_rate / chunk_size / 1000.0
+                    post_wake_grace_chunks = int(POST_WAKE_GRACE_MS * chunks_per_ms)
+                    logger.info(f"Post-wake grace: discarding {post_wake_grace_chunks} chunks ({POST_WAKE_GRACE_MS}ms)")
                     # Play short beep to confirm wake word heard
                     try:
                         subprocess.Popen(["aplay", "-q", "-t", "raw", "-f", "S16_LE",
@@ -438,6 +447,19 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
                     except Exception:
                         pass
                 continue
+
+            # Discard audio during post-wake grace period (avoid capturing wake word echo/beep)
+            if post_wake_grace_chunks > 0:
+                post_wake_grace_chunks -= 1
+                continue
+
+            # Conversation hold: stay listening after TTS without requiring wake word
+            if wake_mode and wake_detector and not waiting_for_wake:
+                if time.monotonic() > conversation_hold_until and conversation_hold_until > 0:
+                    logger.info("Conversation hold expired, returning to wake word mode")
+                    waiting_for_wake = True
+                    print(f"[Listener] Say '{KWS_KEYWORD}' to activate", file=sys.stderr, flush=True)
+                    continue
 
             # Process through VAD
             speech = vad.process(samples)
