@@ -64,8 +64,9 @@ SHERPA_TTS_SPEED = float(os.environ.get("SHERPA_TTS_SPEED", "1.0"))  # Speech sp
 KWS_MODEL = os.environ.get("KWS_MODEL", os.path.expanduser("~/tts-models/sherpa-onnx-kws-zipformer-gigaspeech-3.3M-2024-01-01"))
 KWS_KEYWORD = os.environ.get("KWS_KEYWORD", "hey homer")  # Wake word phrase
 KWS_THRESHOLD = float(os.environ.get("KWS_THRESHOLD", "0.5"))  # Detection threshold (lower = more sensitive)
-POST_WAKE_GRACE_MS = int(os.environ.get("POST_WAKE_GRACE_MS", "1500"))  # Discard audio after wake word (avoid echo)
+POST_WAKE_GRACE_MS = int(os.environ.get("POST_WAKE_GRACE_MS", "2500"))  # Discard audio after wake word (avoid echo)
 CONVERSATION_HOLD_S = int(os.environ.get("CONVERSATION_HOLD_S", "10"))  # Stay listening after response before returning to wake word
+MIN_SPEECH_DURATION = float(os.environ.get("MIN_SPEECH_DURATION", "0.5"))  # Min speech length to trigger VAD
 
 # Supertonic TTS settings
 SUPERTONIC_DIR = os.environ.get("SUPERTONIC_DIR", os.path.expanduser("~/supertonic/py"))
@@ -95,7 +96,7 @@ TTS_TIMEOUT = int(os.environ.get("TTS_TIMEOUT", "30"))  # Timeout for TTS (secon
 WATCHDOG_TIMEOUT = int(os.environ.get("WATCHDOG_TIMEOUT", "60"))  # Max seconds between heartbeats
 
 # Audio gain (software AGC for quiet microphones)
-AUDIO_GAIN = float(os.environ.get("AUDIO_GAIN", "5.0"))  # Multiply audio signal by this factor (1.0 = no gain)
+AUDIO_GAIN = float(os.environ.get("AUDIO_GAIN", "3.0"))  # Multiply audio signal by this factor (1.0 = no gain)
 
 # Configure logging
 logging.basicConfig(
@@ -207,7 +208,7 @@ class VoiceActivityDetector:
         config = sherpa_onnx.VadModelConfig()
         config.silero_vad.model = SILERO_VAD_MODEL
         config.silero_vad.min_silence_duration = 0.5  # Seconds of silence to end speech
-        config.silero_vad.min_speech_duration = 0.25  # Minimum speech length to trigger
+        config.silero_vad.min_speech_duration = MIN_SPEECH_DURATION  # Minimum speech length to trigger
         config.sample_rate = sample_rate
         # Buffer size in seconds - how much audio to buffer before processing
         self.vad = sherpa_onnx.VoiceActivityDetector(config, buffer_size_in_seconds=30)
