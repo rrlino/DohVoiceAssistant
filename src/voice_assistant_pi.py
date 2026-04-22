@@ -65,7 +65,7 @@ KWS_MODEL = os.environ.get("KWS_MODEL", os.path.expanduser("~/tts-models/sherpa-
 KWS_KEYWORD = os.environ.get("KWS_KEYWORD", "hey homer")  # Wake word phrase
 KWS_THRESHOLD = float(os.environ.get("KWS_THRESHOLD", "0.5"))  # Detection threshold (lower = more sensitive)
 POST_WAKE_GRACE_MS = int(os.environ.get("POST_WAKE_GRACE_MS", "2500"))  # Discard audio after wake word (avoid echo)
-CONVERSATION_HOLD_S = int(os.environ.get("CONVERSATION_HOLD_S", "10"))  # Stay listening after response before returning to wake word
+SESSION_TIMEOUT_S = int(os.environ.get("SESSION_TIMEOUT_S", "60"))  # Seconds of silence before returning to wake word mode
 MIN_SPEECH_DURATION = float(os.environ.get("MIN_SPEECH_DURATION", "0.5"))  # Min speech length to trigger VAD
 
 # Supertonic TTS settings
@@ -347,7 +347,7 @@ class WakeWordDetector:
 # Threaded Voice Assistant
 # ============================================================================
 
-def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, processing_event: threading.Event, sample_rate: int = 16000, wake_mode: bool = False):
+def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, processing_event: threading.Event, sample_rate: int = 16000, wake_mode: bool = False, session_end_event: threading.Event = None):
     """
     Thread 1: Continuously listen for speech using Silero VAD.
 
@@ -405,7 +405,8 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
     memory_check_counter = 0
     waiting_for_wake = wake_mode and wake_detector is not None  # Start in wake mode if enabled
     post_wake_grace_chunks = 0  # Counter: discard audio chunks after wake word detection
-    conversation_hold_until = 0  # Timestamp: stay listening (no wake word) until this time
+    session_active = False  # True after wake word detected, False after timeout
+    last_speech_time = 0  # Timestamp of last speech segment during active session
     try:
         if use_sounddevice:
             import sounddevice as sd
@@ -454,20 +455,27 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
                 vad.reset()
                 if wake_detector:
                     wake_detector.reset()
-                # After TTS finishes, stay in conversation mode for CONVERSATION_HOLD_S seconds
-                # before returning to wake word listening
-                if wake_mode and wake_detector:
-                    conversation_hold_until = time.monotonic() + CONVERSATION_HOLD_S
+                continue
+
+            # Check if processor requested session end (e.g. "go to sleep")
+            if session_end_event and session_end_event.is_set():
+                session_end_event.clear()
+                session_active = False
+                waiting_for_wake = True
+                last_speech_time = 0
+                logger.info("Session ended by voice command, returning to wake word mode")
+                print(f"[Listener] Say '{KWS_KEYWORD}' to activate", file=sys.stderr, flush=True)
                 continue
 
             # Convert to float32 normalized to [-1, 1] and apply software gain
             samples = apply_agc(np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0)
 
-            # Wake word mode: listen for keyword before accepting speech
+            # State: WAKE WORD LISTENING — waiting for "hey homer"
             if waiting_for_wake and wake_detector:
                 if wake_detector.process(samples):
                     print(f"[Listener] Wake word '{KWS_KEYWORD}' detected!", file=sys.stderr, flush=True)
                     waiting_for_wake = False
+                    session_active = True
                     vad.reset()
                     # Start grace period: discard next N chunks to avoid capturing wake word echo/beep
                     chunks_per_ms = sample_rate / chunk_size / 1000.0
@@ -488,10 +496,11 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
                 post_wake_grace_chunks -= 1
                 continue
 
-            # Conversation hold: stay listening after TTS without requiring wake word
-            if wake_mode and wake_detector and not waiting_for_wake:
-                if time.monotonic() > conversation_hold_until and conversation_hold_until > 0:
-                    logger.info("Conversation hold expired, returning to wake word mode")
+            # Session timeout: if no speech for SESSION_TIMEOUT_S, go back to wake word
+            if session_active and wake_mode and wake_detector:
+                if last_speech_time > 0 and time.monotonic() - last_speech_time > SESSION_TIMEOUT_S:
+                    logger.info(f"Session timeout ({SESSION_TIMEOUT_S}s silence), returning to wake word mode")
+                    session_active = False
                     waiting_for_wake = True
                     print(f"[Listener] Say '{KWS_KEYWORD}' to activate", file=sys.stderr, flush=True)
                     continue
@@ -501,6 +510,10 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
             if speech is not None:
                 duration = len(speech) / sample_rate
                 print(f"[Listener] Detected {duration:.1f}s speech segment", file=sys.stderr, flush=True)
+
+                # Reset session timeout on each speech segment
+                if session_active:
+                    last_speech_time = time.monotonic()
 
                 # Put in queue (non-blocking, drop if full to avoid backlog)
                 try:
@@ -522,7 +535,7 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
                 proc.kill()
 
 
-def processor_thread(audio_queue: queue.Queue, stop_event: threading.Event, processing_event: threading.Event, args):
+def processor_thread(audio_queue: queue.Queue, stop_event: threading.Event, processing_event: threading.Event, args, session_end_event: threading.Event = None):
     """
     Thread 2: Process speech segments through STT → LLM → TTS pipeline.
 
@@ -601,8 +614,16 @@ def processor_thread(audio_queue: queue.Queue, stop_event: threading.Event, proc
 
             print(f"You: {text}", flush=True)
 
-            # Check for exit commands
-            if any(w in text.lower() for w in ["goodbye", "bye", "exit", "quit", "stop listening"]):
+            # Check for session-end commands (go to sleep, back to wake word mode)
+            if any(w in text.lower() for w in ["go to sleep", "sleep", "stop listening", "that's all"]):
+                if session_end_event:
+                    print("[Processor] Ending session, returning to wake word mode", file=sys.stderr, flush=True)
+                    speak("Going to sleep. Say hey homer to wake me.", args.tts)
+                    session_end_event.set()
+                    continue
+
+            # Check for exit commands (full program shutdown)
+            if any(w in text.lower() for w in ["goodbye", "bye", "exit", "quit"]):
                 print("Goodbye!", flush=True)
                 speak("Goodbye!", args.tts)
                 stop_event.set()
@@ -659,17 +680,18 @@ def run_threaded_assistant(args):
     audio_queue = queue.Queue(maxsize=3)  # Limit queue to avoid backlog
     stop_event = threading.Event()
     processing_event = threading.Event()  # Set when processing to mute listener
+    session_end_event = threading.Event()  # Set by processor to end session and return to wake word mode
 
     wake_mode = getattr(args, 'wake', False)
 
     listener = threading.Thread(
         target=listener_thread,
-        args=(audio_queue, stop_event, processing_event, AUDIO_SAMPLE_RATE, wake_mode),
+        args=(audio_queue, stop_event, processing_event, AUDIO_SAMPLE_RATE, wake_mode, session_end_event),
         name="ListenerThread"
     )
     processor = threading.Thread(
         target=processor_thread,
-        args=(audio_queue, stop_event, processing_event, args),
+        args=(audio_queue, stop_event, processing_event, args, session_end_event),
         name="ProcessorThread"
     )
 
@@ -680,6 +702,8 @@ def run_threaded_assistant(args):
     processor.start()
 
     print("\nThreaded voice assistant running. Say 'goodbye' or 'exit' to quit.\n")
+    if wake_mode:
+        print(f"Say '{KWS_KEYWORD}' to start a session. Say 'go to sleep' to end it.\n")
 
     # Health monitoring loop
     last_health_log = time.time()
