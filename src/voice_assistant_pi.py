@@ -89,8 +89,13 @@ MAX_MEMORY_PERCENT = int(os.environ.get("MAX_MEMORY_PERCENT", "85"))  # Warn at 
 CRITICAL_MEMORY_PERCENT = int(os.environ.get("CRITICAL_MEMORY_PERCENT", "95"))  # Force cleanup at this %
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "30"))  # Timeout for LLM requests (seconds)
 LLM_MAX_TOKENS = int(os.environ.get("LLM_MAX_TOKENS", "80"))  # Max output tokens (prevents PCIe DMA hang on Pi 5 + Hailo x1)
+LLM_COOLDOWN = float(os.environ.get("LLM_COOLDOWN", "30"))  # Min seconds between LLM calls (prevents PCIe crash)
+LLM_SYSTEM_PROMPT = os.environ.get("LLM_SYSTEM_PROMPT", "You are Homer, a voice assistant. Answer in one short sentence. Be concise and direct.")
 TTS_TIMEOUT = int(os.environ.get("TTS_TIMEOUT", "30"))  # Timeout for TTS (seconds)
 WATCHDOG_TIMEOUT = int(os.environ.get("WATCHDOG_TIMEOUT", "60"))  # Max seconds between heartbeats
+
+# Audio gain (software AGC for quiet microphones)
+AUDIO_GAIN = float(os.environ.get("AUDIO_GAIN", "5.0"))  # Multiply audio signal by this factor (1.0 = no gain)
 
 # Configure logging
 logging.basicConfig(
@@ -98,6 +103,13 @@ logging.basicConfig(
     format='%(asctime)s [%(levelname)s] %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+
+def apply_agc(samples):
+    """Apply software gain to boost quiet audio. Clips output to [-1, 1]."""
+    import numpy as np
+    boosted = np.asarray(samples, dtype=np.float32) * AUDIO_GAIN
+    return np.clip(boosted, -1.0, 1.0)
 
 
 # ============================================================================
@@ -260,6 +272,11 @@ class WakeWordDetector:
         )
         self.sample_rate = sample_rate
         self.stream = self.kws.create_stream()
+        self._chunk_count = 0
+        self._ready_count = 0
+        self._rms_sum = 0.0
+        self._peak = 0.0
+        self._last_debug = time.monotonic()
         logger.info(f"Wake word detector loaded: '{keyword}' (threshold={threshold})")
 
     @staticmethod
@@ -288,13 +305,30 @@ class WakeWordDetector:
     def process(self, samples) -> bool:
         """Process audio chunk. Returns True if wake word detected."""
         import numpy as np
+        arr = np.asarray(samples) if not isinstance(samples, np.ndarray) else samples
         if isinstance(samples, np.ndarray):
             self.stream.accept_waveform(self.sample_rate, samples.tolist())
         else:
             self.stream.accept_waveform(self.sample_rate, list(samples))
 
+        self._chunk_count += 1
+        self._rms_sum += float(np.sqrt(np.mean(arr.astype(np.float32) ** 2)))
+        self._peak = max(self._peak, float(np.max(np.abs(arr))))
+
+        # Periodic debug log every 30 seconds (~300 chunks)
+        now = time.monotonic()
+        if now - self._last_debug >= 30:
+            avg_rms = self._rms_sum / max(self._chunk_count, 1)
+            logger.info(f"[KWS] chunks={self._chunk_count}, ready={self._ready_count}, avg_rms={avg_rms:.4f}, peak={self._peak:.4f}")
+            self._chunk_count = 0
+            self._ready_count = 0
+            self._rms_sum = 0.0
+            self._peak = 0.0
+            self._last_debug = now
+
         # Check if enough frames are ready, decode once per chunk
         if self.kws.is_ready(self.stream):
+            self._ready_count += 1
             self.kws.decode_stream(self.stream)
             keyword = self.kws.get_result(self.stream)
             if keyword:
@@ -425,8 +459,8 @@ def listener_thread(audio_queue: queue.Queue, stop_event: threading.Event, proce
                     conversation_hold_until = time.monotonic() + CONVERSATION_HOLD_S
                 continue
 
-            # Convert to float32 normalized to [-1, 1]
-            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+            # Convert to float32 normalized to [-1, 1] and apply software gain
+            samples = apply_agc(np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0)
 
             # Wake word mode: listen for keyword before accepting speech
             if waiting_for_wake and wake_detector:
@@ -545,8 +579,9 @@ def processor_thread(audio_queue: queue.Queue, stop_event: threading.Event, proc
             try:
                 # Convert to numpy array if needed (sherpa-onnx returns list)
                 audio_array = np.array(audio, dtype=np.float32)
-                # Convert float32 back to int16 for WAV
-                audio_int16 = (audio_array * 32768).astype(np.int16)
+                # Apply software gain and clip to prevent NaN/overflow on int16 cast
+                audio_array = np.clip(audio_array * AUDIO_GAIN, -1.0, 1.0)
+                audio_int16 = (audio_array * 32767).astype(np.int16)
                 with wave.open(temp_wav, "wb") as wf:
                     wf.setnchannels(1)
                     wf.setsampwidth(2)
@@ -911,13 +946,34 @@ def listen(engine: str = None) -> str:
 # LLM Functions
 # ============================================================================
 
+# Global LLM cooldown tracker
+_last_llm_call = 0.0
+
+
+def _wait_llm_cooldown():
+    """Wait if needed to respect LLM_COOLDOWN between calls (prevents PCIe crash)."""
+    global _last_llm_call
+    elapsed = time.monotonic() - _last_llm_call
+    if elapsed < LLM_COOLDOWN:
+        wait = LLM_COOLDOWN - elapsed
+        logger.info(f"[LLM] Cooldown: waiting {wait:.1f}s (last call {elapsed:.1f}s ago)")
+        time.sleep(wait)
+
+
+def _format_prompt(user_text: str) -> str:
+    """Prepend system prompt to user text for single-turn LLM calls."""
+    return f"{LLM_SYSTEM_PROMPT}\n\nUser: {user_text}\nAssistant:"
+
+
 def call_llm(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIMEOUT,
              max_tokens: int = None) -> str:
+    global _last_llm_call
+    _wait_llm_cooldown()
     try:
         import requests
     except ImportError:
         sys.exit("pip install requests")
-    payload = {"model": MODEL, "prompt": prompt, "stream": False,
+    payload = {"model": MODEL, "prompt": _format_prompt(prompt), "stream": False,
                "options": {"num_predict": max_tokens or LLM_MAX_TOKENS}}
     r = requests.post(
         f"{host}/api/generate",
@@ -925,6 +981,7 @@ def call_llm(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIMEOUT,
         headers={"Content-Type": "application/json"},
         timeout=timeout,
     )
+    _last_llm_call = time.monotonic()
     r.raise_for_status()
     return r.json().get("response", "").strip()
 
@@ -932,11 +989,13 @@ def call_llm(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIMEOUT,
 def call_llm_stream(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIMEOUT,
                     max_tokens: int = None):
     """Yield response chunks as they arrive (Ollama NDJSON stream)."""
+    global _last_llm_call
+    _wait_llm_cooldown()
     try:
         import requests
     except ImportError:
         sys.exit("pip install requests")
-    payload = {"model": MODEL, "prompt": prompt, "stream": True,
+    payload = {"model": MODEL, "prompt": _format_prompt(prompt), "stream": True,
                "options": {"num_predict": max_tokens or LLM_MAX_TOKENS}}
     r = requests.post(
         f"{host}/api/generate",
@@ -946,6 +1005,7 @@ def call_llm_stream(prompt: str, host: str = OLLAMA_HOST, timeout: int = LLM_TIM
         timeout=timeout,
     )
     r.raise_for_status()
+    _last_llm_call = time.monotonic()
     for line in r.iter_lines(decode_unicode=True):
         if not line:
             continue
