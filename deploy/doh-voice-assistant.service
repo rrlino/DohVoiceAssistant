@@ -3,6 +3,8 @@ Description=Doh Voice Assistant (STT -> LLM -> TTS pipeline)
 After=network.target hailo-ollama.service sound.target
 Wants=hailo-ollama.service
 Requires=sound.target
+StartLimitIntervalSec=120
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -13,14 +15,31 @@ ExecStartPre=/bin/sleep 15
 ExecStart=/home/rrlino/DohVoiceAssistant/.venv/bin/python3 /home/rrlino/DohVoiceAssistant/src/voice_assistant_pi.py --threaded --tts sherpa
 Restart=on-failure
 RestartSec=15
-StartLimitIntervalSec=120
-StartLimitBurst=5
 
-# Resource limits
+# Resilience: keep at least one core free so kernel/network/SSH stay responsive.
+# Pi 5 has 4 cores. Pin the assistant to cores 0-2 and cap CPU to 280%
+# so core 3 (and ~20% slack) is always available for the OS.
+CPUAffinity=0-2
+CPUQuota=280%
+Nice=5
+IOWeight=50
+
+# Memory: hard cap at 2G, soft pressure at 1.5G to nudge GC before OOM.
+MemoryHigh=1500M
 MemoryMax=2G
+
+# OOM: kill us before the kernel kills something important.
+OOMScoreAdjust=200
+
+# Environment
 Environment=HOME=/home/rrlino
 Environment=SHERPA_TTS_MODEL=/home/rrlino/tts-models/vits-piper-en_US-joe-medium
 Environment=OLLAMA_HOST=http://127.0.0.1:8000
+# Cap component thread counts so no single stage saturates all 4 cores.
+Environment=SHERPA_TTS_THREADS=2
+Environment=STT_THREADS=2
+Environment=OMP_NUM_THREADS=2
+Environment=MKL_NUM_THREADS=2
 
 # Logging
 StandardOutput=journal
